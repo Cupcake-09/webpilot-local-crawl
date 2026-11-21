@@ -27,7 +27,7 @@ function Card({ title, meta, series, filename, children }) {
   )
 }
 
-function BarChart({ series }) {
+function BarChart({ series, unit = 'mentions' }) {
   const [active, setActive] = useState(null)
   const max = Math.max(1, ...series.map((point) => point.value))
   const width = 480
@@ -44,7 +44,7 @@ function BarChart({ series }) {
       <div className="mb-2 h-5 text-[12px] text-[#9B9B9B]">
         {current ? (
           <span className="text-[#ECECEC]">
-            {current.label} <span className="text-[#9B9B9B]">· {current.value} mentions</span>
+            {current.label} <span className="text-[#9B9B9B]">· {current.value} {unit}</span>
           </span>
         ) : (
           'Hover a bar for its value'
@@ -99,7 +99,7 @@ function BarChart({ series }) {
   )
 }
 
-function LineChart({ series }) {
+function LineChart({ series, unit = '%' }) {
   const [active, setActive] = useState(null)
   const max = Math.max(1, ...series.map((point) => point.value))
   const width = 480
@@ -121,7 +121,7 @@ function LineChart({ series }) {
       <div className="mb-2 h-5 text-[12px] text-[#9B9B9B]">
         {current ? (
           <span className="text-[#ECECEC]">
-            {current.label} <span className="text-[#9B9B9B]">· {current.value}% signal</span>
+            {current.label} <span className="text-[#9B9B9B]">· {current.value}{unit} {unit === '%' ? 'signal' : 'dwell'}</span>
           </span>
         ) : (
           'Hover a point to inspect a decile'
@@ -331,20 +331,20 @@ export default function JuliusNapkin({ visuals, busy, error, research }) {
       <div className="grid gap-4 lg:grid-cols-2">
         <Card
           title={visuals.bar?.title || 'Term frequency'}
-          meta={`${visuals.bar?.series?.length || 0} terms · mentions`}
+          meta={`${visuals.bar?.series?.length || 0} terms · ${visuals.bar?.unit || 'mentions'}`}
           series={visuals.bar?.series}
-          filename="webpilot-term-frequency.csv"
+          filename="webpilot-gripped-concepts.csv"
         >
-          <BarChart series={visuals.bar?.series || []} />
+          <BarChart series={visuals.bar?.series || []} unit={visuals.bar?.unit || 'mentions'} />
         </Card>
 
         <Card
           title={visuals.line?.title || 'Signal density'}
-          meta="Share of signal-bearing words per reading decile"
+          meta={visuals.line?.meta || 'Share of signal-bearing words per reading decile'}
           series={visuals.line?.series}
-          filename="webpilot-signal-density.csv"
+          filename="webpilot-density-dwell.csv"
         >
-          <LineChart series={visuals.line?.series || []} />
+          <LineChart series={visuals.line?.series || []} unit={visuals.line?.unit || '%'} />
         </Card>
 
         <Card
@@ -356,7 +356,10 @@ export default function JuliusNapkin({ visuals, busy, error, research }) {
           <Breakdown series={visuals.breakdown?.series || []} />
         </Card>
 
-        <Card title="Concept map" meta="Entities linked to the research question">
+        <Card
+          title={visuals.diagram?.title || 'Concept map'}
+          meta="Session concepts linked by the crawler's traversal path"
+        >
           <ConceptMap diagram={visuals.diagram || { nodes: [], edges: [] }} />
         </Card>
       </div>

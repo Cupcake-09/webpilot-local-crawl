@@ -1,18 +1,27 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { downloadCSV } from '../lib/api.js'
+import {
+  MAX_EDGES,
+  MAX_ENTITIES,
+  MAX_MEMORY_WORDS,
+  MAX_SECTIONS,
+  MEMORY_FLUSH_MS,
+} from '../lib/insectMemory.js'
 
 /**
- * Original open-source DOM crawler, ported from web-crawlers/js/crawler.js
- * (github.com/cyohei9907/web-crawlers, "a procedural spider that walks on the DOM").
+ * DOM crawler for the research stage.
  *
- * The body, abdomen/spine chain and every leg are the original implementation:
- * 8 legs + 2 palps, two-bone analytic IK with a fixed knee side, tetrapod gait,
- * urgent/over-extension retraction and feet anchored to real words.
+ * The legs and gait follow web-crawlers/js/crawler.js: 8 legs + 2 palps,
+ * two-bone analytic IK with a fixed knee side, tetrapod gait, and
+ * urgent/over-extension retraction. The body is an exact four-segment
+ * articulated oval: head, two thorax segments, and a larger abdomen.
  *
- * Two deliberate changes keep it usable inside a research stage:
+ * Three deliberate changes keep it usable inside a research stage:
  *  - word boxes are measured once and cached; the animation frame loop never
  *    calls getBoundingClientRect();
- *  - transient filler mutations use transform/opacity only.
+ *  - transient word and filler mutations use transform/opacity only;
+ *  - bounded session telemetry rolls up from the rAF closure and flushes at
+ *    1.5s intervals and on completion.
  */
 
 const STARTER = `# WebPilot research
@@ -31,6 +40,12 @@ const STOPWORDS = new Set(
 
 const TERMINAL = /[.!?]["')\]]?$/
 const SIGNAL = /^[A-Z0-9]/
+
+const BODY_SEGMENTS = 4
+const MAX_LEG_LENGTH = 82
+const MAX_WORD_SNAP_RADIUS = 84
+const MAX_STEP_THRESHOLD = 52
+const GLITCH_MS = 650
 
 function stripInline(text) {
   return text
@@ -185,12 +200,17 @@ function ReadingBody({ model }) {
   })
 }
 
-export default function CentipedeCrawler({ markdown, streaming, mode, query, source }) {
+export default function CentipedeCrawler({ markdown, streaming, mode, query, source, sessionId, completed, onTelemetry, telemetryExportRef }) {
   const contentRef = useRef(null)
   const canvasRef = useRef(null)
   const cacheRef = useRef({
     words: [],
     sentences: [],
+    blocks: [],
+    wordBlock: [],
+    blockWordCount: [],
+    sectionInfo: [],
+    wordSection: [],
     boxes: new Map(),
     els: new Map(),
     left: 0,
@@ -205,9 +225,12 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
 
   const modeRef = useRef(mode)
   modeRef.current = mode
-  const metaRef = useRef({ query, source })
-  metaRef.current = { query, source }
+  const metaRef = useRef({ query, source, sessionId, completed })
+  metaRef.current = { query, source, sessionId, completed }
+  const telemetryHandlerRef = useRef(onTelemetry)
+  telemetryHandlerRef.current = onTelemetry
 
+  const telemetryStateRef = useRef(null)
   const [rows, setRows] = useState([])
   const [drawerOpen, setDrawerOpen] = useState(
     () => typeof window === 'undefined' || window.matchMedia('(min-width: 1024px)').matches,
@@ -233,6 +256,35 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       const activeModel = modelRef.current
       cache.words = activeModel.words
       cache.sentences = activeModel.sentences
+      cache.blocks = activeModel.blocks
+      cache.wordBlock = new Array(activeModel.words.length).fill(0)
+      cache.blockWordCount = activeModel.blocks.map((block) => block.wordIds.length)
+      activeModel.blocks.forEach((block, blockIndex) => {
+        for (const id of block.wordIds) cache.wordBlock[id] = blockIndex
+      })
+
+      const sections = []
+      let section = null
+      const ensureSection = (title) => {
+        section = { index: sections.length, title, wordIds: [] }
+        sections.push(section)
+        return section
+      }
+      activeModel.blocks.forEach((block) => {
+        if (block.type.startsWith('h')) {
+          const title = block.wordIds.map((id) => activeModel.words[id]?.text || '').join(' ').trim()
+          ensureSection(title || `Section ${sections.length + 1}`)
+        } else if (!section) {
+          ensureSection('Opening')
+        }
+        section.wordIds.push(...block.wordIds)
+      })
+      if (!sections.length) ensureSection('Opening')
+      cache.sectionInfo = sections.map((item) => ({ ...item, wordCount: item.wordIds.length }))
+      cache.wordSection = new Array(activeModel.words.length).fill(0)
+      for (const item of cache.sectionInfo) {
+        for (const id of item.wordIds) cache.wordSection[id] = item.index
+      }
 
       const rect = el.getBoundingClientRect()
       const left = rect.left + window.scrollX
@@ -326,8 +378,8 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
 
     // Monochrome palette with a single slate-blue accent, matching the UI.
     const C = {
-      leg: '#8F8F8F',
-      legHi: '#C9C9C9',
+      femur: '#ECECEC',
+      tibia: '#8F8F8F',
       joint: '#38BDF8',
       body: '#E4E4E4',
       bodyFill: 'rgba(33,33,33,.9)',
@@ -335,17 +387,24 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
     const THREAD_COLORS = ['#475569', '#64748B', '#94A3B8']
 
     const SCALE = window.innerWidth < 640 ? 1.02 : 1.32
-    const LW = 1.25 * Math.sqrt(SCALE)
+    const BODY_S = SCALE * 0.95
+    const BODY_DEF = [
+      { gap: 0, rx: 8.8, ry: 7.1 },
+      { gap: 13.2, rx: 9.8, ry: 7.7 },
+      { gap: 27.2, rx: 10.6, ry: 8.3 },
+      { gap: 43.4, rx: 13.4, ry: 10.8 },
+    ]
+    const LW = 1.35 * Math.sqrt(SCALE)
     const DR = Math.pow(SCALE, 0.6)
     const T = {
-      cruise: 860,
+      cruise: 210,
       lure: 880,
-      cursor: 48,
+      cursor: 165,
       burstFloor: 0.6,
       stopChance: 0.04,
       stopTime: [0.25, 0.6],
       arrive: 48,
-      stepFrac: 0.3,
+      stepFrac: 0.68,
       urgentFrac: 0.5,
       overFrac: 0.92,
       placeFrac: 0.85,
@@ -363,19 +422,15 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       [2.55, 126, -5],
       [0.22, 38, 10],
     ]
-    let LEG_MAX = 0
-    let legs = []
+    const rawLegs = []
     for (const side of [1, -1]) {
       LEG_DEF.forEach(([angle, reach, hip], index) => {
-        const r = reach * SCALE
-        legs.push({
+        rawLegs.push({
           side,
           idx: index,
           ang: angle * side,
-          reach: r,
+          rawReach: reach * SCALE,
           hip: hip * SCALE,
-          L1: r * 0.56,
-          L2: r * 0.64,
           palp: index === 4,
           foot: null,
           next: null,
@@ -391,7 +446,16 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         })
       })
     }
-    LEG_MAX = Math.max(...legs.map((leg) => leg.L1 + leg.L2))
+    const NATURAL_LEG_SPAN = 72
+    const rawLongest = Math.max(...rawLegs.map((leg) => leg.rawReach * 1.2))
+    const LEG_SCALE = rawLongest ? NATURAL_LEG_SPAN / rawLongest : 1
+    const legs = rawLegs.map((leg) => ({
+      ...leg,
+      reach: leg.rawReach * LEG_SCALE,
+      L1: leg.rawReach * 0.56 * LEG_SCALE,
+      L2: leg.rawReach * 0.64 * LEG_SCALE,
+    }))
+    const LEG_MAX = Math.max(...legs.map((leg) => leg.L1 + leg.L2))
 
     const S = {
       p: V(0, 0),
@@ -402,6 +466,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       target: V(),
       tUntil: 0,
       phase: R() * 10,
+      spine: Array.from({ length: BODY_SEGMENTS }, () => V()),
       abd: V(),
       spin: V(),
     }
@@ -422,8 +487,28 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
     const threads = []
     const flashes = []
     const queue = { add: [], remove: [], fill: [] }
+    const activeGlitches = new Map()
+    const glitchUntil = new Map()
+    const touchedWords = new Set()
+    const telemetry =
+      telemetryStateRef.current ||
+      (telemetryStateRef.current = {
+        startedAt: Date.now(),
+        dwellMs: 0,
+        gripCount: 0,
+        grips: new Set(),
+        sectionDwell: new Map(),
+        sectionGrips: new Map(),
+        sectionEntities: new Map(),
+        traversalEdges: new Map(),
+        lastSection: null,
+        lastFlush: 0,
+        completedFlush: false,
+      })
 
     let docBottom = 0
+    let frameNumber = 0
+    let gripActive = false
 
     function resizeCanvas() {
       DPR = Math.min(2, window.devicePixelRatio || 1)
@@ -463,6 +548,18 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       return V(anchor.x, anchor.y)
     }
 
+    /** Word box containing a point. No DOM reads. */
+    function wordAtPoint(point) {
+      for (const word of cache.words) {
+        const box = cache.boxes.get(word.id)
+        if (!box) continue
+        if (point.x >= box.x && point.x <= box.x + box.w && point.y >= box.y && point.y <= box.y + box.h) {
+          return word.id
+        }
+      }
+      return null
+    }
+
     /** Nearest cached word to a point. No DOM reads. */
     function findAnchor(point, radius = 18) {
       let best = null
@@ -483,10 +580,48 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       return best || { id: null, u: 0.5, v: 0.5, x: point.x, y: point.y }
     }
 
+    /**
+     * Foot-target selector. A foot may only take a cached word that is within
+     * MAX_WORD_SNAP_RADIUS of its natural rest position and within physical leg
+     * reach. With no such word it plants on blank canvas at the rest position.
+     */
+    function findFoothold(leg) {
+      const hip = hipPos(leg)
+      const rest = restPos(leg)
+      const target = stepTarget(leg)
+      const maxLength = Math.min(MAX_LEG_LENGTH, leg.L1 + leg.L2)
+      let best = null
+      let bestScore = Infinity
+
+      for (const word of cache.words) {
+        const box = cache.boxes.get(word.id)
+        if (!box) continue
+        const restX = clamp(rest.x, box.x, box.x + box.w)
+        const restY = clamp(rest.y, box.y, box.y + box.h)
+        if (Math.hypot(restX - rest.x, restY - rest.y) > MAX_WORD_SNAP_RADIUS) continue
+
+        const targetX = clamp(target.x, box.x, box.x + box.w)
+        const targetY = clamp(target.y, box.y, box.y + box.h)
+        const score = Math.hypot(targetX - target.x, targetY - target.y)
+        if (score >= bestScore) continue
+
+        const u = clamp((target.x - box.x) / Math.max(1, box.w), 0.12, 0.88)
+        const v = clamp((target.y - box.y) / Math.max(1, box.h), 0.3, 0.7)
+        const x = box.x + u * box.w
+        const y = box.y + v * box.h
+        if (Math.hypot(x - hip.x, y - hip.y) > maxLength - 0.01) continue
+
+        best = { id: word.id, u, v, x, y }
+        bestScore = score
+      }
+
+      return best || { id: null, u: 0.5, v: 0.5, x: rest.x, y: rest.y }
+    }
+
     const forward = () => V(Math.cos(S.heading), Math.sin(S.heading))
     const hipPos = (leg) => add(S.p, rotate(V(leg.hip, leg.side * 3 * SCALE), S.heading))
     const restPos = (leg) => {
-      const k = leg.palp ? 1 : 0.8
+      const k = leg.palp ? 0.96 : 0.9
       return add(hipPos(leg), rotate(V(Math.cos(leg.ang) * leg.reach * k, Math.sin(leg.ang) * leg.reach * k), S.heading))
     }
     const stepTarget = (leg) => {
@@ -511,16 +646,24 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       S.brake = false
     }
 
+    function resetSpine() {
+      const back = mul(forward(), -1)
+      for (let index = 0; index < BODY_SEGMENTS; index += 1) {
+        S.spine[index] = add(S.p, mul(back, BODY_DEF[index].gap * BODY_S))
+      }
+      S.abd = S.spine[BODY_SEGMENTS - 1]
+      S.spin = add(S.abd, mul(back, 7 * BODY_S))
+    }
+
     function initBody() {
       const firstWord = cache.words.find((word) => cache.boxes.has(word.id))
       if (!firstWord) return
       const box = cache.boxes.get(firstWord.id)
       S.p = V(box.x + box.w / 2, Math.max(cache.top + 40, box.y - 34 * SCALE))
-      S.abd = add(S.p, V(0, -17 * SCALE))
-      S.spin = add(S.p, V(0, -30 * SCALE))
       S.target = V(box.x + box.w / 2, box.y + box.h / 2)
       S.tUntil = now + 3
-      for (const leg of legs) leg.foot = findAnchor(restPos(leg), 34)
+      resetSpine()
+      for (const leg of legs) leg.foot = findFoothold(leg)
       bodyReady = true
       camY = Math.max(0, S.p.y - H * 0.46)
     }
@@ -548,7 +691,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       const deltaLength = length(delta)
       if (deltaLength > full) from = add(hip, mul(delta, full / deltaLength))
       leg.from = from
-      leg.next = findAnchor(stepTarget(leg), leg.palp ? 10 : 18 * Math.sqrt(SCALE))
+      leg.next = findFoothold(leg)
       leg.t = 0
       leg.dur = quick ? 0.07 + R() * 0.04 : (leg.palp ? 0.08 : 0.1) + R() * 0.07
       leg.stepping = true
@@ -569,6 +712,19 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       queue.add.push([word.id, 'mut-fill'])
     }
 
+    function glitchWord(word) {
+      if (!word || word.id == null) return
+      if (now < (glitchUntil.get(word.id) || 0)) return
+      const until = now + GLITCH_MS / 1000 + 0.05
+      glitchUntil.set(word.id, until)
+      activeGlitches.set(word.id, until)
+      queue.add.push([word.id, 'word-glitch-vanish'])
+    }
+
+    function sectionIndexAt(wordIndex) {
+      return cache.wordSection[clamp(wordIndex, 0, Math.max(0, cache.words.length - 1))] ?? 0
+    }
+
     function highlightSentence(sentence) {
       for (let index = sentence.keyStart; index <= sentence.keyEnd; index += 1) {
         markClass(cache.words[index], 'key')
@@ -585,9 +741,14 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
           .map((word) => word.text)
           .join(' ')
           .replace(/^[^\w]+|[^\w)]+$/g, '') || sentence.text.split(/\s+/).slice(0, 4).join(' ')
+      const locked = entity.slice(0, 90)
+      const sectionIndex = sectionIndexAt(sentence.start)
+      const bucket = telemetry.sectionEntities.get(sectionIndex) || new Map()
+      bucket.set(locked, (bucket.get(locked) || 0) + 1)
+      telemetry.sectionEntities.set(sectionIndex, bucket)
       rowHandlerRef.current({
         key,
-        entity: entity.slice(0, 90),
+        entity: locked,
         detail: sentence.text,
         source: metaRef.current.source || metaRef.current.query || 'research',
       })
@@ -640,6 +801,15 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       flashes.push({ anchor: leg.foot, t: now })
       const word = cache.words[leg.foot.id]
       if (leg.foot.id != null && word) {
+        touchedWords.add(word.id)
+        if (gripActive) {
+          if (!telemetry.grips.has(word.id)) {
+            telemetry.grips.add(word.id)
+            telemetry.gripCount += 1
+            const sectionIndex = sectionIndexAt(word.id)
+            telemetry.sectionGrips.set(sectionIndex, (telemetry.sectionGrips.get(sectionIndex) || 0) + 1)
+          }
+        }
         if (word.filler) mutateFiller(word)
         else if (R() < 0.12) leg.tint = '#D4D4D4'
         if (leg.tint) leg.tintUntil = now + 0.8
@@ -674,6 +844,69 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       )
     }
 
+    function updateSpine(dt) {
+      const back = mul(forward(), -1)
+      S.spine[0] = lerp(S.spine[0], S.p, damp(18, dt))
+      for (let index = 1; index < BODY_SEGMENTS; index += 1) {
+        const gap = (BODY_DEF[index].gap - BODY_DEF[index - 1].gap) * BODY_S
+        const desired = add(S.spine[index - 1], mul(back, gap))
+        S.spine[index] = lerp(S.spine[index], desired, damp(12 - index * 0.8, dt))
+      }
+
+      S.abd = S.spine[BODY_SEGMENTS - 1]
+      const before = S.spine[BODY_SEGMENTS - 2]
+      const tail = sub(S.abd, before)
+      const tailLength = length(tail) || 1
+      S.spin = add(S.abd, mul(tail, (7 * BODY_S) / tailLength))
+    }
+
+    function buildMemorySnapshot() {
+      const meta = metaRef.current
+      if (!meta.sessionId) return null
+      const sections = cache.sectionInfo.slice(-MAX_SECTIONS).map((item) => {
+        const entities = [...(telemetry.sectionEntities.get(item.index) || new Map()).entries()]
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, MAX_ENTITIES)
+          .map(([label]) => label)
+        return {
+          section: item.title,
+          dwellMs: Math.round(telemetry.sectionDwell.get(item.index) || 0),
+          avgSegments: BODY_SEGMENTS,
+          gripCount: telemetry.sectionGrips.get(item.index) || 0,
+          lockedEntities: entities,
+          words: Math.min(MAX_MEMORY_WORDS, item.wordCount),
+        }
+      })
+      const traversalEdges = [...telemetry.traversalEdges.entries()]
+        .map(([key, weight]) => {
+          const [from, to] = key.split('\u0000')
+          return { from, to, weight }
+        })
+        .filter((edge) => edge.from && edge.to && edge.from !== edge.to)
+        .sort((a, b) => b.weight - a.weight)
+        .slice(0, MAX_EDGES)
+      return {
+        id: String(meta.sessionId),
+        query: meta.query || '',
+        source: meta.source || '',
+        startedAt: telemetry.startedAt,
+        updatedAt: Date.now(),
+        wordCount: Math.min(MAX_MEMORY_WORDS, cache.words.length),
+        dwellMs: Math.round(telemetry.dwellMs),
+        avgSegments: BODY_SEGMENTS,
+        gripCount: telemetry.gripCount,
+        sections,
+        traversalEdges,
+      }
+    }
+
+    function flushTelemetry(complete = false) {
+      const snapshot = buildMemorySnapshot()
+      if (snapshot) telemetryHandlerRef.current?.(snapshot, { complete })
+      telemetry.lastFlush = now
+      if (complete) telemetry.completedFlush = true
+    }
+
     let nextThread = 0
 
     function update(dt) {
@@ -685,8 +918,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         initBody()
         if (!bodyReady) {
           S.p = V((cache.left + cache.right) / 2 || W / 2, window.scrollY + H * 0.45)
-          S.abd = add(S.p, V(0, -17 * SCALE))
-          S.spin = add(S.p, V(0, -30 * SCALE))
+          resetSpine()
         }
       }
 
@@ -717,10 +949,10 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         Math.max(0, Math.sin(S.phase * 3.1) * 0.6 + Math.sin(S.phase * 1.27) * 0.5 + 0.35),
         0.7,
       )
-      const burst = auto ? T.burstFloor + (1.15 - T.burstFloor) * Math.min(1, pulse) : 1
+      const burst = auto ? T.burstFloor + (1 - T.burstFloor) * Math.min(1, pulse) : 1
       const to = sub(S.target, S.p)
       const d = length(to)
-      const maxSpeed = auto ? T.cruise * Math.sqrt(SCALE) * burst : T.cursor
+      const maxSpeed = auto ? T.cruise * burst : T.cursor
       const brake = !auto || S.brake
       const want = d > 2 ? mul(to, (brake ? Math.min(maxSpeed, d * 2.2) : maxSpeed) / d) : V()
       S.v = lerp(S.v, want, damp(auto ? 5 : 3.4, dt))
@@ -730,11 +962,23 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       if (speed > 3) S.heading = angleLerp(S.heading, Math.atan2(S.v.y, S.v.x), damp(4 + speed * 0.02, dt))
       S.heading += (R() - 0.5) * 0.02
 
-      const abdomenTarget = add(S.p, mul(forward(), -17 * SCALE))
-      S.abd = lerp(S.abd, abdomenTarget, damp(12, dt))
-      const spinDelta = sub(S.spin, S.abd)
-      const spinLength = length(spinDelta) || 1
-      S.spin = lerp(S.spin, add(S.abd, mul(spinDelta, (13 * SCALE) / spinLength)), damp(14, dt))
+      gripActive = auto || (mouse.has && speed > 4)
+      if (bodyReady && gripActive) {
+        const sectionIndex = sectionIndexAt(readIndex)
+        telemetry.dwellMs += dt * 1000
+        telemetry.sectionDwell.set(sectionIndex, (telemetry.sectionDwell.get(sectionIndex) || 0) + dt * 1000)
+        if (telemetry.lastSection != null && telemetry.lastSection !== sectionIndex) {
+          const from = cache.sectionInfo[telemetry.lastSection]?.title
+          const to = cache.sectionInfo[sectionIndex]?.title
+          if (from && to) {
+            const key = `${from}\u0000${to}`
+            telemetry.traversalEdges.set(key, (telemetry.traversalEdges.get(key) || 0) + 1)
+          }
+        }
+        telemetry.lastSection = sectionIndex
+      }
+
+      updateSpine(dt)
 
       const maxStepping = speed > 70 ? 6 : 4
       for (const leg of legs) {
@@ -747,7 +991,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         const off = distance(foot, restPos(leg))
         const over = distance(foot, hipPos(leg)) > (leg.L1 + leg.L2) * T.overFrac
         const urgent = off > leg.reach * T.urgentFrac
-        const threshold = leg.reach * (leg.palp ? 0.25 : T.stepFrac)
+        const threshold = Math.min(MAX_STEP_THRESHOLD, leg.reach * (leg.palp ? 0.25 : T.stepFrac))
         if (over || urgent) startStep(leg, true)
         else if (off > threshold && steppingCount() < maxStepping && !neighbourStepping(leg)) startStep(leg, false)
         else if (speed < 4 && R() < dt * 0.3) startStep(leg, false)
@@ -772,12 +1016,29 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       for (const [id, until] of activeFills) {
         if (now > until) {
           activeFills.delete(id)
-          queue.remove.push(id)
+          queue.remove.push([id, 'mut-fill'])
+        }
+      }
+      for (const [id, until] of activeGlitches) {
+        if (now > until) {
+          activeGlitches.delete(id)
+          glitchUntil.delete(id)
+          queue.remove.push([id, 'word-glitch-vanish'])
         }
       }
       for (let index = flashes.length - 1; index >= 0; index -= 1) {
         if (now - flashes[index].t > 0.3) flashes.splice(index, 1)
       }
+
+      if (frameNumber % 3 === 0) {
+        const headWord = wordAtPoint(add(S.spine[0], mul(forward(), 7 * BODY_S)))
+        if (headWord != null) touchedWords.add(headWord)
+        for (const id of touchedWords) glitchWord(cache.words[id])
+        touchedWords.clear()
+      }
+
+      if (now - telemetry.lastFlush >= MEMORY_FLUSH_MS / 1000) flushTelemetry(false)
+      if (metaRef.current.completed && !telemetry.completedFlush) flushTelemetry(true)
 
       // Camera: only the autonomous reader scrolls the page, and only forward.
       if (auto) {
@@ -811,6 +1072,13 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       ctx.fill()
     }
 
+    function clampFoot(hip, foot, leg) {
+      const delta = sub(foot, hip)
+      const d = length(delta)
+      const max = Math.min(MAX_LEG_LENGTH, leg.L1 + leg.L2)
+      return d > max ? add(hip, mul(delta, max / d)) : foot
+    }
+
     function ik(hip, foot, leg) {
       const d = distance(hip, foot)
       const base = Math.atan2(foot.y - hip.y, foot.x - hip.x)
@@ -818,6 +1086,22 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       const cosine = clamp((leg.L1 * leg.L1 + d * d - leg.L2 * leg.L2) / (2 * leg.L1 * d), -1, 1)
       const angle = base + leg.bend * Math.acos(cosine)
       return add(hip, V(Math.cos(angle) * leg.L1, Math.sin(angle) * leg.L1))
+    }
+
+    function reticle(point) {
+      const r = 5.2 * DR
+      const arm = 1.8 * DR
+      ctx.strokeStyle = '#475569'
+      ctx.lineWidth = 0.9
+      ctx.beginPath()
+      for (const sx of [-1, 1]) {
+        for (const sy of [-1, 1]) {
+          ctx.moveTo(point.x + sx * r, point.y + sy * (r - arm))
+          ctx.lineTo(point.x + sx * r, point.y + sy * r)
+          ctx.lineTo(point.x + sx * (r - arm), point.y + sy * r)
+        }
+      }
+      ctx.stroke()
     }
 
     function draw() {
@@ -845,20 +1129,22 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         let foot
         if (leg.stepping) {
           const ease = leg.t * leg.t * (3 - 2 * leg.t)
-          foot = lerp(leg.from, anchorPos(leg.next), ease)
+          const target = leg.next?.id == null ? restPos(leg) : anchorPos(leg.next)
+          foot = lerp(leg.from, target, ease)
           foot = lerp(foot, hip, Math.sin(Math.PI * leg.t) * 0.18)
         } else {
-          foot = leg.foot ? anchorPos(leg.foot) : restPos(leg)
+          foot = leg.foot?.id != null ? anchorPos(leg.foot) : restPos(leg)
         }
+        foot = clampFoot(hip, foot, leg)
         const knee = ik(hip, foot, leg)
         leg.knee = knee
         leg.tip = foot
-        const tint = leg.tint && now < leg.tintUntil ? leg.tint : null
-        const width = leg.palp ? LW * 0.75 : LW
-        line(P(hip), P(knee), tint || C.leg, width)
-        line(P(knee), P(foot), tint || (leg.idx === 3 ? C.legHi : C.leg), width)
-        dot(P(knee), C.joint, leg.palp ? 1.5 : 2.2)
-        dot(P(foot), tint || C.joint, leg.palp ? 1.3 : 2)
+        const width = leg.palp ? LW * 0.72 : LW
+        line(P(hip), P(knee), C.femur, width)
+        line(P(knee), P(foot), C.tibia, width)
+        dot(P(knee), C.joint, leg.palp ? 1.7 : 2.5)
+        dot(P(foot), C.joint, leg.palp ? 1.5 : 2.2)
+        if (!leg.stepping && leg.foot?.id != null) reticle(P(foot))
       }
 
       for (const flash of flashes) {
@@ -871,41 +1157,64 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         ctx.stroke()
       }
 
-      // Original body: cephalothorax box + abdomen/spine chain.
-      const head = add(S.p, mul(forward(), 12 * SCALE))
-      line(P(head), P(S.p), C.body)
-      line(P(S.p), P(S.abd), C.leg, LW * 1.15)
-      line(P(S.abd), P(S.spin), C.leg)
+      // Exact four-segment articulated oval: head, two thorax ovals, abdomen.
+      for (let index = 1; index < BODY_SEGMENTS; index += 1) {
+        line(P(S.spine[index - 1]), P(S.spine[index]), 'rgba(143,143,143,.45)', 1)
+      }
       for (const leg of legs) {
         if (!leg.palp && leg.idx % 2 === 0) {
-          line(P(S.abd), P(hipPos(leg)), 'rgba(143,143,143,.35)', 1)
+          line(P(S.spine[1]), P(hipPos(leg)), 'rgba(143,143,143,.28)', 1)
         }
       }
 
-      const centre = P(S.p)
-      ctx.save()
-      ctx.translate(centre.x, centre.y)
-      ctx.rotate(S.heading)
-      ctx.scale(SCALE, SCALE)
-      ctx.fillStyle = C.bodyFill
-      ctx.strokeStyle = C.body
-      ctx.lineWidth = 1.2 / SCALE
-      ctx.fillRect(-8, -5.5, 18, 11)
-      ctx.strokeRect(-8, -5.5, 18, 11)
-      ctx.restore()
-      dot(P(head), C.joint, 2)
-      dot(P(S.abd), C.joint, 2.5)
-      dot(P(S.spin), C.joint, 1.8)
+      for (let index = 0; index < BODY_SEGMENTS; index += 1) {
+        const a = S.spine[Math.max(0, index - 1)]
+        const b = S.spine[Math.min(BODY_SEGMENTS - 1, index + 1)]
+        const angle = index === 0 ? Math.atan2(S.spine[0].y - b.y, S.spine[0].x - b.x) : Math.atan2(a.y - b.y, a.x - b.x)
+        const centre = P(S.spine[index])
+        const rx = BODY_DEF[index].rx * BODY_S
+        const ry = BODY_DEF[index].ry * BODY_S
+        ctx.beginPath()
+        ctx.ellipse(centre.x, centre.y, rx, ry, angle, 0, Math.PI * 2)
+        ctx.fillStyle = C.bodyFill
+        ctx.fill()
+        ctx.strokeStyle = index === 0 ? C.body : C.tibia
+        ctx.lineWidth = 1
+        ctx.stroke()
+        ctx.beginPath()
+        ctx.ellipse(centre.x, centre.y, rx * 0.62, ry * 0.4, angle, 0, Math.PI * 2)
+        ctx.strokeStyle = 'rgba(236,236,236,.13)'
+        ctx.stroke()
+      }
+      const abdomen = P(S.spine[BODY_SEGMENTS - 1])
+      dot(abdomen, C.joint, 2.9)
+
+      const back = sub(S.spin, S.abd)
+      const backLength = length(back) || 1
+      const backUnit = mul(back, 1 / backLength)
+      const sideUnit = V(-backUnit.y, backUnit.x)
+      const spinneretBase = add(S.abd, mul(backUnit, 4 * BODY_S))
+      for (const side of [-1, 1]) {
+        const tip = add(spinneretBase, add(mul(backUnit, 6 * BODY_S), mul(sideUnit, side * 2.6 * BODY_S)))
+        line(P(spinneretBase), P(tip), C.tibia, 0.85)
+        dot(P(tip), C.joint, 1.1)
+      }
+
+      const head = add(S.spine[0], mul(forward(), 11 * BODY_S))
+      line(P(S.spine[0]), P(head), C.body)
+      dot(P(head), C.joint, 1.8)
+      for (let index = 1; index < BODY_SEGMENTS; index += 1) dot(P(S.spine[index]), C.joint, 1.15)
+      dot(P(S.spin), C.joint, 1.4)
     }
 
     function commit() {
+      for (const [id, cls] of queue.remove) {
+        const el = cache.els.get(id)
+        if (el) el.classList.remove(cls)
+      }
       for (const [id, cls] of queue.add) {
         const el = cache.els.get(id)
         if (el) el.classList.add(cls)
-      }
-      for (const id of queue.remove) {
-        const el = cache.els.get(id)
-        if (el) el.classList.remove('mut-fill')
       }
       queue.add.length = 0
       queue.remove.length = 0
@@ -919,6 +1228,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       const dt = Math.min(0.05, (time - last) / 1000)
       last = time
       now += dt
+      frameNumber += 1
       update(dt)
       draw()
       commit()
@@ -933,6 +1243,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       cameraHold = now + 3
     }
 
+    if (telemetryExportRef) telemetryExportRef.current = buildMemorySnapshot
     resizeCanvas()
     refreshBounds()
     window.addEventListener('mousemove', onMouseMove)
@@ -942,6 +1253,9 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
 
     return () => {
       cancelAnimationFrame(frameId)
+      flushTelemetry(true)
+      telemetryStateRef.current = null
+      if (telemetryExportRef) telemetryExportRef.current = () => null
       window.removeEventListener('mousemove', onMouseMove)
       window.removeEventListener('wheel', onWheel)
       window.removeEventListener('resize', resizeCanvas)

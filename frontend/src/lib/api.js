@@ -116,11 +116,11 @@ export async function streamResearch({ query, settings, signal, onChunk }) {
 }
 
 /** POST /api/generate-visuals → bar / line / breakdown / concept diagram data. */
-export async function generateVisuals({ query, markdown, source, rows = [], settings }) {
+export async function generateVisuals({ query, markdown, source, rows = [], memory = null, settings }) {
   const res = await fetch(`${API_BASE}/api/generate-visuals`, {
     method: 'POST',
     headers: jsonHeaders(settings),
-    body: JSON.stringify({ query, markdown, source, rows }),
+    body: JSON.stringify({ query, markdown, source, rows, memory }),
   })
 
   if (!res.ok) throw new Error(await readError(res))

@@ -38,6 +38,7 @@ class VisualRequest(BaseModel):
     markdown: str = ""
     source: str = ""
     rows: list[dict] = []
+    memory: dict | None = None
 
 
 class PodcastRequest(BaseModel):
@@ -73,6 +74,20 @@ def _chat_endpoint(base_url: str) -> str:
 
 def _llm_headers(api_key: str) -> dict:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+
+def _safe_int(value, fallback: int = 0) -> int:
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _safe_float(value, fallback: float = 0.0) -> float:
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _json_object(raw) -> dict:
@@ -231,10 +246,42 @@ async def generate_visuals(req: VisualRequest):
     if not words:
         words = re.findall(r"\S+", req.query or "research")
 
+    memory = req.memory if isinstance(req.memory, dict) else {}
+    memory_sections = []
+    for item in (memory.get("sections") if isinstance(memory.get("sections"), list) else [])[-12:]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("section") or "Section").strip()[:48] or "Section"
+        entities = [str(entity).strip()[:80] for entity in (item.get("lockedEntities") or []) if str(entity).strip()][:8]
+        memory_sections.append(
+            {
+                "title": title,
+                "dwellMs": _safe_float(item.get("dwellMs")),
+                "gripCount": _safe_int(item.get("gripCount")),
+                "words": _safe_int(item.get("words")),
+                "entities": entities,
+            }
+        )
+    memory_edges = []
+    for edge in (memory.get("traversalEdges") if isinstance(memory.get("traversalEdges"), list) else [])[:25]:
+        if not isinstance(edge, dict):
+            continue
+        source_node = str(edge.get("from") or "").strip()[:48]
+        target_node = str(edge.get("to") or "").strip()[:48]
+        if source_node and target_node and source_node != target_node:
+            memory_edges.append(
+                {"from": source_node, "to": target_node, "weight": max(1, _safe_int(edge.get("weight"), 1))}
+            )
+
     keyword_pairs = _keywords(markdown, 6)
     if not keyword_pairs:
         keyword_pairs = [(word.lower(), 1) for word in words[:6] if len(word) > 3]
     bar_series = [{"label": label, "value": count} for label, count in keyword_pairs]
+    bar_title = "Term frequency"
+    bar_unit = "mentions"
+    line_title = "Signal density"
+    line_unit = "%"
+    line_meta = "Share of signal-bearing words per reading decile"
 
     segments = 8
     size = max(1, (len(words) + segments - 1) // segments)
@@ -277,26 +324,93 @@ async def generate_visuals(req: VisualRequest):
             if value:
                 breakdown.append({"label": label, "value": value})
 
+    if memory_sections:
+        line_title = "Section density · dwell"
+        line_unit = "s"
+        line_meta = "Seconds the crawler dwelled in each section"
+        line_series = [
+            {"label": section["title"], "value": round(section["dwellMs"] / 1000, 1)}
+            for section in memory_sections
+        ] or [{"label": "0-100%", "value": 0}]
+
+        grip_counts: dict[str, int] = {}
+        for section in memory_sections:
+            for entity in section["entities"]:
+                grip_counts[entity] = grip_counts.get(entity, 0) + max(1, section["gripCount"])
+        if grip_counts:
+            bar_title = "Gripped concepts"
+            bar_unit = "grips"
+            bar_series = [
+                {"label": label, "value": value}
+                for label, value in sorted(grip_counts.items(), key=lambda item: (-item[1], item[0]))[:6]
+            ]
+        else:
+            bar_title = "Grips by section"
+            bar_unit = "grips"
+            bar_series = [
+                {"label": section["title"], "value": section["gripCount"]}
+                for section in memory_sections
+                if section["gripCount"]
+            ][:6]
+        memory_breakdown = [
+            {"label": section["title"], "value": section["words"]}
+            for section in memory_sections
+            if section["words"]
+        ]
+        if memory_breakdown:
+            breakdown = memory_breakdown
+
     question = (req.query or "Research question").strip()[:46] or "Research question"
     nodes = [{"id": "q", "label": question, "group": "question"}]
-    for index, (label, _count) in enumerate(keyword_pairs[:5]):
-        nodes.append({"id": f"k{index}", "label": label.capitalize(), "group": "concept"})
-    edges = [{"from": "q", "to": node["id"], "label": ""} for node in nodes[1:]]
-    for index in range(1, len(nodes) - 1):
-        edges.append({"from": nodes[index]["id"], "to": nodes[index + 1]["id"], "label": "related"})
+    edges = []
+    if memory_sections:
+        title_to_id = {}
+        for index, section in enumerate(memory_sections):
+            node_id = f"s{index}"
+            title_to_id[section["title"]] = node_id
+            nodes.append({"id": node_id, "label": section["title"], "group": "concept"})
+        for edge in memory_edges:
+            source_id = title_to_id.get(edge["from"])
+            target_id = title_to_id.get(edge["to"])
+            if source_id and target_id:
+                edges.append({"from": source_id, "to": target_id, "label": "traversed"})
+        section_ids = [node["id"] for node in nodes[1:]]
+        if section_ids:
+            edges.insert(0, {"from": "q", "to": section_ids[0], "label": ""})
+        if not memory_edges:
+            for index in range(1, len(section_ids)):
+                edges.append({"from": section_ids[index - 1], "to": section_ids[index], "label": "next"})
+    else:
+        for index, (label, _count) in enumerate(keyword_pairs[:5]):
+            nodes.append({"id": f"k{index}", "label": label.capitalize(), "group": "concept"})
+        edges = [{"from": "q", "to": node["id"], "label": ""} for node in nodes[1:]]
+        for index in range(1, len(nodes) - 1):
+            edges.append({"from": nodes[index]["id"], "to": nodes[index + 1]["id"], "label": "related"})
 
     source = (req.source or "research").strip()
+    memory_summary = ""
+    if memory_sections:
+        memory_summary = (
+            f" Crawler telemetry retained {_safe_int(memory.get('gripCount')):,} grips and "
+            f"{round(_safe_float(memory.get('dwellMs')) / 1000, 1):,.1f}s of dwell across "
+            f"{len(memory_sections)} sections."
+        )
     return {
         "status": "success",
         "summary": (
             f"{len(words):,} words analysed from {source}. "
             f"{len(_split_sentences(markdown))} sentences mapped across {len(breakdown)} sections."
+            f"{memory_summary}"
         ),
         "source": source,
-        "bar": {"title": "Term frequency", "unit": "mentions", "series": bar_series},
-        "line": {"title": "Signal density", "unit": "%", "series": line_series},
+        "bar": {"title": bar_title, "unit": bar_unit, "series": bar_series},
+        "line": {"title": line_title, "unit": line_unit, "series": line_series, "meta": line_meta},
         "breakdown": {"title": "Section mix", "unit": "words", "series": breakdown},
-        "diagram": {"title": "Concept map", "nodes": nodes, "edges": edges},
+        "diagram": {
+            "title": "Traversal concept map" if memory_sections else "Concept map",
+            "nodes": nodes,
+            "edges": edges,
+        },
     }
 
 

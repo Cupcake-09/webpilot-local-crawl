@@ -1,9 +1,20 @@
 import { useEffect, useRef, useState } from 'react'
 import CentipedeCrawler from './components/CentipedeCrawler.jsx'
 import JuliusNapkin from './components/JuliusNapkin.jsx'
+import MemoryModal from './components/MemoryModal.jsx'
 import PodcastStudio from './components/PodcastStudio.jsx'
 import SettingsModal from './components/SettingsModal.jsx'
 import { generatePodcast, generateVisuals, runAgent, streamResearch } from './lib/api.js'
+import {
+  activeSession,
+  beginMemorySession,
+  entityCount,
+  gripTotal,
+  loadInsectMemory,
+  memoryForVisuals,
+  mergeMemorySession,
+  saveInsectMemory,
+} from './lib/insectMemory.js'
 import { loadLlmSettings, llmLabel } from './lib/llm.js'
 
 const VIEWS = [
@@ -73,6 +84,15 @@ function hostLabel(url) {
   }
 }
 
+function unwrapMarkdownLinks(value) {
+  const source = String(value ?? '')
+  if (!/\[[^\]]*\]\([^)]+\)/.test(source)) return source
+  return source.replace(/\[([^\]]*)\]\(([^)]+)\)/g, (_match, label, href) => {
+    const url = String(href || '').trim().replace(/^<|>$/g, '')
+    return url || label
+  })
+}
+
 function closeOnMobile(setSidebarOpen) {
   if (typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches) {
     setSidebarOpen(false)
@@ -97,8 +117,31 @@ export default function App() {
   const [history, setHistory] = useState([])
   const [draft, setDraft] = useState('')
   const [notice, setNotice] = useState('')
+  const [memory, setMemory] = useState(loadInsectMemory)
+  const [memoryOpen, setMemoryOpen] = useState(false)
 
   const sequenceRef = useRef(0)
+  const memoryRef = useRef(memory)
+  const telemetryExportRef = useRef(() => null)
+  const memorySession = activeSession(memory)
+  const memoryEntities = entityCount(memorySession)
+  const memoryGrips = gripTotal(memorySession)
+
+  const commitMemory = (next) => {
+    memoryRef.current = next
+    setMemory(next)
+    saveInsectMemory(next)
+  }
+
+  const ingestTelemetry = (snapshot) => {
+    if (!snapshot) return
+    commitMemory(mergeMemorySession(memoryRef.current, snapshot))
+  }
+
+  const startMemorySession = (id, query, source) => {
+    const next = beginMemorySession(memoryRef.current, { id: String(id), query, source })
+    commitMemory(next)
+  }
   const activeView = VIEWS.find((item) => item.id === view) ?? VIEWS[0]
   const busy = Boolean(research?.busy)
 
@@ -113,7 +156,7 @@ export default function App() {
     })
   }
 
-  const runGenerators = (id, markdown, meta, snapshot) => {
+  const runGenerators = (id, markdown, meta, snapshot, memoryState) => {
     setVisuals(null)
     setPodcast(null)
     setVisualsError('')
@@ -126,6 +169,7 @@ export default function App() {
       markdown,
       source: meta.source,
       settings: snapshot,
+      memory: memoryForVisuals(memoryState),
     })
       .then((data) => {
         if (sequenceRef.current === id) setVisuals(data)
@@ -154,17 +198,23 @@ export default function App() {
   }
 
   const completeResearch = (id, markdown, meta, snapshot) => {
+    const finalTelemetry = telemetryExportRef.current?.()
+    let settledMemory = memoryRef.current
+    if (finalTelemetry) {
+      settledMemory = mergeMemorySession(settledMemory, finalTelemetry)
+      commitMemory(settledMemory)
+    }
     setResearch((previous) =>
       previous && previous.id === id
         ? { ...previous, markdown, streaming: false, busy: false, completed: true, finishedAt: Date.now() }
         : previous,
     )
-    runGenerators(id, markdown, meta, snapshot)
+    runGenerators(id, markdown, meta, snapshot, settledMemory)
   }
 
   const handleSubmit = async (event) => {
     event.preventDefault()
-    const value = draft.trim()
+    const value = unwrapMarkdownLinks(draft).trim()
     if (!value || busy) return
 
     const id = (sequenceRef.current += 1)
@@ -181,6 +231,7 @@ export default function App() {
 
     if (/^https?:\/\//i.test(value)) {
       const label = hostLabel(value)
+      startMemorySession(id, value, label)
       addHistory(`Read ${label}`, label)
       setResearch({
         id,
@@ -221,6 +272,7 @@ export default function App() {
       return
     }
 
+    startMemorySession(id, value, 'Research essay')
     addHistory(value, 'Research essay')
     setResearch({
       id,
@@ -439,6 +491,10 @@ export default function App() {
             mode={mode}
             query={research?.query || ''}
             source={stageSource}
+            sessionId={research ? String(research.id) : null}
+            completed={Boolean(research?.completed)}
+            onTelemetry={ingestTelemetry}
+            telemetryExportRef={telemetryExportRef}
           />
         ) : (
           <main className="mx-auto w-full max-w-[1120px] px-3 pb-44 pt-6 sm:px-5">
@@ -457,7 +513,7 @@ export default function App() {
         }`}
       >
         <div className="pointer-events-auto mx-auto w-full max-w-[820px]">
-          <div className="mb-2 flex justify-center">
+          <div className="mb-2 flex flex-wrap items-center justify-center gap-2">
             <div
               role="tablist"
               aria-label="Crawler mode"
@@ -486,6 +542,14 @@ export default function App() {
                 )
               })}
             </div>
+            <button
+              type="button"
+              onClick={() => setMemoryOpen(true)}
+              className="rounded-full border border-[#2F2F2F] bg-[#171717] px-3.5 py-1.5 text-[12px] text-[#9B9B9B] transition hover:bg-[#2A2A2A] hover:text-[#ECECEC]"
+              aria-haspopup="dialog"
+            >
+              Memory: {memoryEntities} {memoryEntities === 1 ? 'entity' : 'entities'} · {memoryGrips} grips
+            </button>
           </div>
 
           <form
@@ -495,6 +559,14 @@ export default function App() {
             <input
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
+              onPaste={(event) => {
+                const pasted = event.clipboardData?.getData('text') || ''
+                const unwrapped = unwrapMarkdownLinks(pasted)
+                if (unwrapped !== pasted) {
+                  event.preventDefault()
+                  setDraft(unwrapped)
+                }
+              }}
               placeholder="Ask a research question or paste a URL…"
               aria-label="Ask a research question or paste a URL"
               disabled={busy}
@@ -528,6 +600,7 @@ export default function App() {
         onClose={() => setSettingsOpen(false)}
         onSave={(next) => setSettings(next)}
       />
+      <MemoryModal open={memoryOpen} memory={memory} onClose={() => setMemoryOpen(false)} />
     </div>
   )
 }
