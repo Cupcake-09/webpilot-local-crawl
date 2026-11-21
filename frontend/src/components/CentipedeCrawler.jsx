@@ -45,6 +45,8 @@ const BODY_SEGMENTS = 4
 const MAX_LEG_LENGTH = 82
 const MAX_WORD_SNAP_RADIUS = 84
 const MAX_STEP_THRESHOLD = 52
+const MIN_FOOT_SEPARATION = 26
+const OUTWARD_DOT_MIN = 0.25
 const GLITCH_MS = 650
 
 function stripInline(text) {
@@ -415,30 +417,38 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       threadRange: 230,
     }
 
+    // Wide radial spider fan. Pair 1/2 originate from spine segment 1, pair
+    // 3/4 from segment 2. The final entry is a short pedipalp on the head.
     const LEG_DEF = [
-      [0.55, 118, 7],
-      [1.15, 106, 3],
-      [1.95, 106, -1],
-      [2.55, 126, -5],
-      [0.22, 38, 10],
+      { angle: 38, reach: 68, segment: 1, along: 3 },
+      { angle: 72, reach: 74, segment: 1, along: -3 },
+      { angle: 110, reach: 74, segment: 2, along: 3 },
+      { angle: 145, reach: 70, segment: 2, along: -3 },
+      { angle: 20, reach: 38, segment: 0, along: 0, palp: true },
     ]
-    const rawLegs = []
+    const legs = []
     for (const side of [1, -1]) {
-      LEG_DEF.forEach(([angle, reach, hip], index) => {
-        rawLegs.push({
+      LEG_DEF.forEach((def, index) => {
+        const boneLength = def.reach * (0.56 + 0.64)
+        const boneScale = Math.min(1, MAX_LEG_LENGTH / boneLength)
+        legs.push({
           side,
           idx: index,
-          ang: angle * side,
-          rawReach: reach * SCALE,
-          hip: hip * SCALE,
-          palp: index === 4,
+          ang: (def.angle * Math.PI) / 180 * side,
+          reach: def.reach,
+          segment: def.segment,
+          along: def.along,
+          palp: Boolean(def.palp),
           foot: null,
           next: null,
           from: null,
           t: 0,
           dur: 0.15,
           stepping: false,
-          bend: (index === 3 || index === 4 ? 1 : -1) * side,
+          // Mirror the knee across the body: right legs bend +, left legs -.
+          bend: side,
+          L1: def.reach * 0.56 * boneScale,
+          L2: def.reach * 0.64 * boneScale,
           tint: null,
           tintUntil: 0,
           knee: V(),
@@ -446,15 +456,6 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         })
       })
     }
-    const NATURAL_LEG_SPAN = 72
-    const rawLongest = Math.max(...rawLegs.map((leg) => leg.rawReach * 1.2))
-    const LEG_SCALE = rawLongest ? NATURAL_LEG_SPAN / rawLongest : 1
-    const legs = rawLegs.map((leg) => ({
-      ...leg,
-      reach: leg.rawReach * LEG_SCALE,
-      L1: leg.rawReach * 0.56 * LEG_SCALE,
-      L2: leg.rawReach * 0.64 * LEG_SCALE,
-    }))
     const LEG_MAX = Math.max(...legs.map((leg) => leg.L1 + leg.L2))
 
     const S = {
@@ -490,6 +491,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
     const activeGlitches = new Map()
     const glitchUntil = new Map()
     const touchedWords = new Set()
+    const claimedWordIndices = new Set()
     const telemetry =
       telemetryStateRef.current ||
       (telemetryStateRef.current = {
@@ -582,20 +584,26 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
 
     /**
      * Foot-target selector. A foot may only take a cached word that is within
-     * MAX_WORD_SNAP_RADIUS of its natural rest position and within physical leg
-     * reach. With no such word it plants on blank canvas at the rest position.
+     * MAX_WORD_SNAP_RADIUS of its natural rest position, within physical leg
+     * reach, on its own side of the spine and clear of the other feet. Words
+     * are claimed per frame so two legs can never plant on the same word.
      */
     function findFoothold(leg) {
       const hip = hipPos(leg)
       const rest = restPos(leg)
       const target = stepTarget(leg)
       const maxLength = Math.min(MAX_LEG_LENGTH, leg.L1 + leg.L2)
+      const outward = outwardNormal(leg)
+      const spine = S.spine[leg.segment]
       let best = null
       let bestScore = Infinity
 
       for (const word of cache.words) {
         const box = cache.boxes.get(word.id)
         if (!box) continue
+        // The id is the stable word index; never share it with another foot.
+        if (claimedWordIndices.has(word.id)) continue
+
         const restX = clamp(rest.x, box.x, box.x + box.w)
         const restY = clamp(rest.y, box.y, box.y + box.h)
         if (Math.hypot(restX - rest.x, restY - rest.y) > MAX_WORD_SNAP_RADIUS) continue
@@ -611,18 +619,64 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         const y = box.y + v * box.h
         if (Math.hypot(x - hip.x, y - hip.y) > maxLength - 0.01) continue
 
+        // Reject a foot that crosses the spine or crowds an existing foot.
+        const fromCenter = sub(V(x, y), spine)
+        const centerLength = length(fromCenter) || 1
+        if ((fromCenter.x * outward.x + fromCenter.y * outward.y) / centerLength <= OUTWARD_DOT_MIN) continue
+        if (!footIsClear(leg, V(x, y))) continue
+
         best = { id: word.id, u, v, x, y }
         bestScore = score
       }
 
-      return best || { id: null, u: 0.5, v: 0.5, x: rest.x, y: rest.y }
+      const chosen = best || { id: null, u: 0.5, v: 0.5, x: rest.x, y: rest.y }
+      if (chosen.id != null) claimedWordIndices.add(chosen.id)
+      return chosen
+    }
+
+    function footIsClear(leg, point) {
+      for (const other of legs) {
+        if (other === leg) continue
+        if (other.foot) {
+          if (distance(point, anchorPos(other.foot)) < MIN_FOOT_SEPARATION) return false
+        }
+        if (other.stepping && other.next) {
+          if (distance(point, anchorPos(other.next)) < MIN_FOOT_SEPARATION) return false
+        }
+      }
+      return true
+    }
+
+    function refreshFootholdClaims() {
+      claimedWordIndices.clear()
+      for (const leg of legs) {
+        if (leg.foot?.id != null) claimedWordIndices.add(leg.foot.id)
+        if (leg.stepping && leg.next?.id != null) claimedWordIndices.add(leg.next.id)
+      }
     }
 
     const forward = () => V(Math.cos(S.heading), Math.sin(S.heading))
-    const hipPos = (leg) => add(S.p, rotate(V(leg.hip, leg.side * 3 * SCALE), S.heading))
+    const spineTangent = (index) => {
+      // Point tangents toward the head so +side is the screen-right normal.
+      const a = S.spine[Math.min(BODY_SEGMENTS - 1, index + 1)]
+      const b = S.spine[Math.max(0, index - 1)]
+      const tangent = sub(b, a)
+      const tangentLength = length(tangent) || 1
+      return mul(tangent, 1 / tangentLength)
+    }
+    const outwardNormal = (leg) => {
+      const tangent = spineTangent(leg.segment)
+      return V(-tangent.y * leg.side, tangent.x * leg.side)
+    }
+    const hipPos = (leg) => {
+      const tangent = spineTangent(leg.segment)
+      const lateral = leg.palp ? 3 : 6
+      const anchor = add(S.spine[leg.segment], mul(tangent, leg.along))
+      return add(anchor, V(-tangent.y * lateral * leg.side, tangent.x * lateral * leg.side))
+    }
     const restPos = (leg) => {
-      const k = leg.palp ? 0.96 : 0.9
-      return add(hipPos(leg), rotate(V(Math.cos(leg.ang) * leg.reach * k, Math.sin(leg.ang) * leg.reach * k), S.heading))
+      // The reach values are the exact radial rest distances from the hip.
+      return add(hipPos(leg), rotate(V(Math.cos(leg.ang) * leg.reach, Math.sin(leg.ang) * leg.reach), S.heading))
     }
     const stepTarget = (leg) => {
       const hip = hipPos(leg)
@@ -663,6 +717,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       S.target = V(box.x + box.w / 2, box.y + box.h / 2)
       S.tUntil = now + 3
       resetSpine()
+      claimedWordIndices.clear()
       for (const leg of legs) leg.foot = findFoothold(leg)
       bodyReady = true
       camY = Math.max(0, S.p.y - H * 0.46)
@@ -911,6 +966,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
 
     function update(dt) {
       refreshBounds()
+      refreshFootholdClaims()
       const currentMode = modeRef.current
       const auto = currentMode !== 'cursor'
 
@@ -1163,7 +1219,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       }
       for (const leg of legs) {
         if (!leg.palp && leg.idx % 2 === 0) {
-          line(P(S.spine[1]), P(hipPos(leg)), 'rgba(143,143,143,.28)', 1)
+          line(P(S.spine[leg.segment]), P(hipPos(leg)), 'rgba(143,143,143,.28)', 1)
         }
       }
 
