@@ -1,0 +1,219 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  html {
+    scroll-behavior: auto;
+    overflow-anchor: none;
+  }
+
+  body {
+    @apply bg-[#0D0D0D] text-[#ECECEC] antialiased;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
+  }
+
+  ::selection {
+    background: rgba(56, 189, 248, 0.24);
+    color: #ffffff;
+  }
+
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: #171717;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: #2f2f2f;
+    border-radius: 99px;
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background: #454545;
+  }
+}
+
+/* ── Reading stage ─────────────────────────────────────────────────── */
+
+.reader-content {
+  color: #ececec;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 16px;
+  line-height: 1.75;
+  letter-spacing: -0.003em;
+}
+
+.reader-content h1 {
+  margin: 0 0 1.25rem;
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  color: #ececec;
+}
+
+.reader-content h2 {
+  margin: 2rem 0 0.75rem;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  color: #ececec;
+}
+
+.reader-content h3 {
+  margin: 1.5rem 0 0.5rem;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.5;
+  color: #ececec;
+}
+
+.reader-content p {
+  margin: 0 0 1.25rem;
+}
+
+.reader-content blockquote {
+  margin: 0 0 1.25rem;
+  border-left: 2px solid #2f2f2f;
+  padding-left: 1rem;
+  color: #9b9b9b;
+}
+
+.reader-content .reader-li {
+  display: flex;
+  gap: 0.65rem;
+  margin: 0 0 0.6rem;
+  padding-left: 0.15rem;
+}
+
+.reader-content .reader-bullet {
+  flex: none;
+  color: #6f6f6f;
+  line-height: 1.75;
+}
+
+.reader-rule {
+  margin: 1.75rem 0;
+  border: 0;
+  border-top: 1px solid #2f2f2f;
+}
+
+/* Every word is a span so the original crawler's feet can grip it. */
+.rw {
+  border-radius: 3px;
+  transition: color 180ms ease, background-color 180ms ease, opacity 180ms ease;
+}
+
+.rw.read {
+  opacity: 0.78;
+}
+
+.rw.key {
+  background: #1e293b;
+  color: #f0f9ff;
+  box-shadow: inset 0 -1px 0 rgba(56, 189, 248, 0.85);
+}
+
+/* Filler mutations are composited only: transform + opacity, never layout. */
+.rw.mut-fill {
+  animation: fillerMut 900ms ease-out;
+  will-change: transform, opacity;
+}
+
+@keyframes fillerMut {
+  0% {
+    opacity: 0.45;
+    transform: translateY(1px) scale(0.97);
+  }
+  55% {
+    opacity: 0.18;
+    transform: translateY(-2px) scale(1.03);
+  }
+  100% {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.reader-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: #38bdf8;
+  animation: caretBlink 1s steps(1) infinite;
+}
+
+@keyframes caretBlink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.note-row {
+  animation: noteIn 240ms ease-out both;
+}
+
+@keyframes noteIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ── Chrome ────────────────────────────────────────────────────────── */
+
+@keyframes researchProgress {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(410%);
+  }
+}
+
+.research-progress {
+  animation: researchProgress 1.4s ease-in-out infinite;
+}
+
+@keyframes rowIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.animate-row-in {
+  animation: rowIn 260ms ease-out both;
+}
