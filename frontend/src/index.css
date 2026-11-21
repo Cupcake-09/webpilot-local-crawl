@@ -117,42 +117,241 @@
 
 /* Every word is a span so the original crawler's feet can grip it. */
 .rw {
+  --effect-duration: 3500ms;
   display: inline-block;
   border-radius: 3px;
+  animation-duration: var(--effect-duration, 3500ms);
   transition: color 180ms ease, background-color 180ms ease, opacity 180ms ease;
 }
 
-/* The spider's head and newly planted feet glitch touched words away. */
-.rw.word-glitch-vanish {
-  animation: wordGlitchVanish 650ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
-  will-change: transform, opacity;
+/* Both word effects leave the inline layout intact while they animate. */
+.rw.rw-paper-burn,
+.rw.rw-cyber-glitch,
+.rw.rw-acid-decay {
+  animation-duration: var(--effect-duration, 3500ms);
+  animation-fill-mode: both;
+  will-change: transform, opacity, color, text-shadow, clip-path;
   pointer-events: none;
 }
 
-@keyframes wordGlitchVanish {
+/* A pixel fire front eats the paper from top to bottom, then pops back in. */
+.rw.rw-paper-burn {
+  animation-name: wordPaperBurn;
+  animation-timing-function: linear;
+}
+
+/* A broken signal tears the word into scanlines before it snaps back. */
+.rw.rw-cyber-glitch {
+  --glitch-color: #00f5d4;
+  animation-name: wordCyberGlitch;
+  animation-timing-function: steps(1, end);
+}
+
+/* Toxic acid etches the word into a pit before it heals back into the page. */
+.rw.rw-acid-decay {
+  animation-name: wordAcidDecay;
+  animation-timing-function: cubic-bezier(0.25, 0.9, 0.35, 1);
+}
+
+@keyframes wordPaperBurn {
+  0% {
+    color: #FEF08A;
+    opacity: 1;
+    clip-path: inset(0% 0 0 0);
+    text-shadow: 0 -2px 0 #F97316, 2px -3px 0 #EF4444, -2px -2px 0 #EA580C;
+    transform: none;
+    animation-timing-function: steps(8, end);
+  }
+  3% {
+    color: #FEF08A;
+    opacity: 1;
+    clip-path: inset(0% 0 0 0);
+    text-shadow: 0 -2px 0 #F97316, 2px -3px 0 #EF4444, -2px -2px 0 #EA580C;
+    transform: none;
+    animation-timing-function: steps(8, end);
+  }
+  8% {
+    color: #78716C;
+    opacity: 1;
+    clip-path: inset(45% 0 0 0);
+    text-shadow: 0 -2px 0 #F97316, 2px -4px 0 #FEF08A, -2px 2px 0 #44403C;
+    transform: none;
+    animation-timing-function: steps(8, end);
+  }
+  13% {
+    color: #44403C;
+    opacity: 0.85;
+    clip-path: inset(80% 0 0 0);
+    text-shadow: 0 -2px 0 #F97316, 2px -4px 0 #FEF08A, -2px 2px 0 #44403C;
+    transform: none;
+    animation-timing-function: steps(8, end);
+  }
+  18% {
+    color: #1C1917;
+    opacity: 0;
+    clip-path: inset(100% 0 0 0);
+    text-shadow: 0 -2px 0 #F97316, 2px -4px 0 #FEF08A, -2px 2px 0 #44403C;
+    transform: none;
+    animation-timing-function: linear;
+  }
+  86% {
+    color: inherit;
+    opacity: 0;
+    clip-path: inset(0% 0 0 0);
+    text-shadow: none;
+    transform: none;
+    animation-timing-function: ease-out;
+  }
+  100% {
+    color: inherit;
+    opacity: 1;
+    clip-path: inset(0 0 0 0);
+    text-shadow: none;
+    transform: none;
+  }
+}
+
+/* Acid burns holes through the glyphs via turbulence + erosion filters.
+   Nothing scales or clips, so the word keeps its exact inline box. */
+@keyframes wordAcidDecay {
   0% {
     opacity: 1;
-    transform: translateX(0) skewX(0) scale(1);
+    filter: none;
+    color: #ECFCCB;
+    text-shadow: 0 0 8px #A3E635, 0 0 2px #FEF08A;
+  }
+  3% {
+    opacity: 1;
+    filter: none;
+    color: #ECFCCB;
+    text-shadow: 0 0 8px #A3E635, 0 0 2px #FEF08A;
+  }
+  4% {
+    opacity: 1;
+    filter: url(#acid-erode-1);
+    color: #BEF264;
+    text-shadow: 0 0 6px #84CC16;
+  }
+  8% {
+    opacity: 1;
+    filter: url(#acid-erode-1);
+    color: #BEF264;
+    text-shadow: 0 0 6px #84CC16;
+  }
+  9% {
+    opacity: 1;
+    filter: url(#acid-erode-2);
+    color: #84CC16;
+    text-shadow: 0 0 8px #65A30D;
+  }
+  13% {
+    opacity: 1;
+    filter: url(#acid-erode-2);
+    color: #84CC16;
+    text-shadow: 0 0 8px #65A30D;
   }
   14% {
-    opacity: 1;
-    transform: translateX(-3px) skewX(-4deg) scale(1.01);
+    opacity: 0.9;
+    filter: url(#acid-erode-3);
+    color: #4D7C0F;
+    text-shadow: none;
   }
-  28% {
-    opacity: 0.55;
-    transform: translateX(3px) skewX(4deg) scale(0.99);
+  18% {
+    opacity: 0.75;
+    filter: url(#acid-erode-3);
+    color: #4D7C0F;
+    text-shadow: none;
   }
-  34% {
+  19% {
     opacity: 0;
-    transform: translateX(-3px) skewX(-3deg) scale(0.98);
+    filter: none;
   }
-  56% {
+  86% {
     opacity: 0;
-    transform: translateX(3px) skewX(3deg) scale(0.98);
+    filter: none;
+    color: inherit;
+    text-shadow: none;
+    animation-timing-function: ease-out;
   }
   100% {
     opacity: 1;
-    transform: translateX(0) skewX(0) scale(1);
+    filter: none;
+    color: inherit;
+    text-shadow: none;
+  }
+}
+
+@keyframes wordCyberGlitch {
+  0% {
+    color: #FFFFFF;
+    opacity: 1;
+    text-shadow: 0 0 4px #FFFFFF, 0 0 10px var(--glitch-color), 0 0 22px var(--glitch-color), 4px 0 #FF1E9E, -4px 0 #00FFFF;
+    clip-path: inset(12% 0 52% 0);
+    transform: translate(-5px, 1px) skewX(24deg);
+  }
+  2% {
+    color: var(--glitch-color);
+    opacity: 1;
+    text-shadow: 0 0 4px #FFFFFF, 0 0 10px var(--glitch-color), 0 0 22px var(--glitch-color), 4px 0 #FF1E9E, -4px 0 #00FFFF;
+    clip-path: inset(58% 0 10% 0);
+    transform: translate(6px, -1px) skewX(-28deg);
+  }
+  4% {
+    color: #FFFFFF;
+    opacity: 1;
+    text-shadow: 0 0 4px #FFFFFF, 0 0 10px var(--glitch-color), 0 0 22px var(--glitch-color), 4px 0 #FF1E9E, -4px 0 #00FFFF;
+    clip-path: inset(0 0 0 0);
+    transform: translate(-4px, 0) scaleX(1.18);
+  }
+  6% {
+    opacity: 0;
+  }
+  8% {
+    color: var(--glitch-color);
+    opacity: 1;
+    text-shadow: 0 0 4px #FFFFFF, 0 0 10px var(--glitch-color), 0 0 22px var(--glitch-color), 4px 0 #FF1E9E, -4px 0 #00FFFF;
+    clip-path: inset(28% 0 34% 0);
+    transform: translate(5px, 1px) skewX(20deg);
+  }
+  10% {
+    color: #FFFFFF;
+    opacity: 1;
+    text-shadow: 0 0 4px #FFFFFF, 0 0 10px var(--glitch-color), 0 0 22px var(--glitch-color), 4px 0 #FF1E9E, -4px 0 #00FFFF;
+    clip-path: inset(5% 0 68% 0);
+    transform: translate(-6px, -1px) scaleY(0.65);
+  }
+  12%,
+  89% {
+    clip-path: inset(50% 0 50% 0);
+    opacity: 0;
+  }
+  90% {
+    color: #FFFFFF;
+    opacity: 0.95;
+    text-shadow: 0 0 4px #FFFFFF, 0 0 10px var(--glitch-color), 0 0 22px var(--glitch-color), 4px 0 #FF1E9E, -4px 0 #00FFFF;
+    clip-path: inset(18% 0 42% 0);
+    transform: translate(4px, 0) skewX(-18deg);
+  }
+  94% {
+    color: var(--glitch-color);
+    opacity: 0.7;
+    text-shadow: 0 0 4px #FFFFFF, 0 0 10px var(--glitch-color), 0 0 22px var(--glitch-color), 4px 0 #FF1E9E, -4px 0 #00FFFF;
+    clip-path: inset(62% 0 8% 0);
+    transform: translate(-6px, 0) skewX(22deg);
+  }
+  98% {
+    color: #FFFFFF;
+    opacity: 1;
+    text-shadow: 0 0 4px #FFFFFF, 0 0 10px var(--glitch-color), 0 0 22px var(--glitch-color), 4px 0 #FF1E9E, -4px 0 #00FFFF;
+    clip-path: inset(34% 0 28% 0);
+    transform: translate(3px, 0) skewX(-12deg);
+  }
+  100% {
+    color: inherit;
+    opacity: 1;
+    clip-path: inset(0 0 0 0);
+    text-shadow: none;
+    transform: none;
   }
 }
 
@@ -170,6 +369,29 @@
 .rw.mut-fill {
   animation: fillerMut 900ms ease-out;
   will-change: transform, opacity;
+}
+
+/* A word effect outranks an in-flight filler shimmer on the same word. */
+.rw.rw-paper-burn.mut-fill,
+.rw.rw-cyber-glitch.mut-fill,
+.rw.rw-acid-decay.mut-fill {
+  animation-duration: var(--effect-duration, 3500ms);
+  animation-fill-mode: both;
+}
+
+.rw.rw-paper-burn.mut-fill {
+  animation-name: wordPaperBurn;
+  animation-timing-function: linear;
+}
+
+.rw.rw-cyber-glitch.mut-fill {
+  animation-name: wordCyberGlitch;
+  animation-timing-function: steps(1, end);
+}
+
+.rw.rw-acid-decay.mut-fill {
+  animation-name: wordAcidDecay;
+  animation-timing-function: cubic-bezier(0.25, 0.9, 0.35, 1);
 }
 
 @keyframes fillerMut {

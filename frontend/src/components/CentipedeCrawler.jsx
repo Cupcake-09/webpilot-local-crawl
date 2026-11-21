@@ -44,10 +44,17 @@ const SIGNAL = /^[A-Z0-9]/
 const BODY_SEGMENTS = 4
 const MAX_LEG_LENGTH = 82
 const MAX_WORD_SNAP_RADIUS = 84
+const CONTACT_RADIUS = 6
 const MAX_STEP_THRESHOLD = 52
 const MIN_FOOT_SEPARATION = 26
 const OUTWARD_DOT_MIN = 0.25
-const GLITCH_MS = 650
+const EMBER_COLORS = ['#FEF08A', '#FB923C', '#EF4444']
+const ASH_COLORS = ['#78716C', '#57534E', '#292524']
+const ACID_BUBBLE_COLORS = ['#ECFCCB', '#BEF264', '#84CC16']
+const ACID_DRIP_COLORS = ['#65A30D', '#4D7C0F']
+const NEON_COLORS = ['#00FFFF', '#FF1E9E', '#D946EF', '#39FF14', '#FFF01F', '#38F8FF']
+const GLITCH_SPARK_COLORS = ['#00FFFF', '#FF1E9E', '#39FF14', '#FFF01F', '#D946EF']
+const EMBER_CAP = 160
 
 function stripInline(text) {
   return text
@@ -334,11 +341,24 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       cacheRef.current.boxes.clear()
       measureRef.current()
     }
+    // Scrolling re-syncs the cached boxes with the reading container so contact
+    // checks and flame rects stay 1:1 with the visible text. Coalesced per frame.
+    let scrollFrame = 0
+    const onScroll = () => {
+      if (scrollFrame) return
+      scrollFrame = window.requestAnimationFrame(() => {
+        scrollFrame = 0
+        measureRef.current()
+      })
+    }
     window.addEventListener('resize', onResize)
+    window.addEventListener('scroll', onScroll, { passive: true })
     if (document.fonts?.ready) document.fonts.ready.then(onResize).catch(() => {})
     return () => {
       observer.disconnect()
+      if (scrollFrame) window.cancelAnimationFrame(scrollFrame)
       window.removeEventListener('resize', onResize)
+      window.removeEventListener('scroll', onScroll)
     }
   }, [])
 
@@ -399,9 +419,9 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
     const LW = 1.35 * Math.sqrt(SCALE)
     const DR = Math.pow(SCALE, 0.6)
     const T = {
-      cruise: 210,
+      cruise: 310,
       lure: 880,
-      cursor: 165,
+      cursor: 255,
       burstFloor: 0.6,
       stopChance: 0.04,
       stopTime: [0.25, 0.6],
@@ -487,10 +507,9 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
     const activeFills = new Map()
     const threads = []
     const flashes = []
+    const embers = []
     const queue = { add: [], remove: [], fill: [] }
-    const activeGlitches = new Map()
-    const glitchUntil = new Map()
-    const touchedWords = new Set()
+    const activeEffects = new Map()
     const claimedWordIndices = new Set()
     const telemetry =
       telemetryStateRef.current ||
@@ -509,7 +528,6 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       })
 
     let docBottom = 0
-    let frameNumber = 0
     let gripActive = false
 
     function resizeCanvas() {
@@ -550,16 +568,136 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       return V(anchor.x, anchor.y)
     }
 
-    /** Word box containing a point. No DOM reads. */
-    function wordAtPoint(point) {
+    /** Shortest distance from a point to a cached word box. No DOM reads. */
+    function distanceToBox(point, box) {
+      const dx = Math.max(box.x - point.x, 0, point.x - (box.x + box.w))
+      const dy = Math.max(box.y - point.y, 0, point.y - (box.y + box.h))
+      return Math.hypot(dx, dy)
+    }
+
+    /**
+     * Word whose box is within CONTACT_RADIUS of a point. Cached boxes are in
+     * page coordinates; the draw transform maps them to canvas pixels.
+     */
+    function wordNearPoint(point, radius = CONTACT_RADIUS) {
+      let best = null
+      let bestDistance = radius
       for (const word of cache.words) {
         const box = cache.boxes.get(word.id)
         if (!box) continue
-        if (point.x >= box.x && point.x <= box.x + box.w && point.y >= box.y && point.y <= box.y + box.h) {
-          return word.id
+        const distance = distanceToBox(point, box)
+        if (distance === 0) return word.id
+        if (distance <= bestDistance) {
+          bestDistance = distance
+          best = word.id
         }
       }
-      return null
+      return best
+    }
+
+    function reserveParticleSlots(count) {
+      if (embers.length + count > EMBER_CAP) embers.splice(0, embers.length + count - EMBER_CAP)
+    }
+
+    function spawnPaperParticles(word) {
+      const box = cache.boxes.get(word.id)
+      if (!box) return
+      const count = 8
+      const perKind = count / 2
+      reserveParticleSlots(count)
+      for (let index = 0; index < count; index += 1) {
+        const ash = index >= perKind
+        const slot = ash ? index - perKind : index
+        const spread = (slot + 0.5) / perKind
+        const x = box.x + (0.08 + spread * 0.84) * box.w + (R() - 0.5) * box.w * 0.06
+        if (ash) {
+          // Ash flakes follow the burn front down the word, tearing off late.
+          embers.push({
+            kind: 'ash',
+            x,
+            y: box.y + (0.4 + spread * 0.5 + (R() - 0.5) * 0.1) * box.h,
+            vx: (R() < 0.5 ? -1 : 1) * (6 + R() * 14),
+            vy: 18 + R() * 24,
+            size: R() < 0.5 ? 2.5 : 3,
+            color: pick(ASH_COLORS),
+            age: 0,
+            ttl: 0.5 + R() * 0.2,
+            delay: 0.06 + spread * 0.14 + R() * 0.02,
+            phase: R() * Math.PI * 2,
+          })
+        } else {
+          // Fire embers burst out of the top edge and flicker upward.
+          embers.push({
+            kind: 'paper-ember',
+            x,
+            y: box.y + (0.06 + spread * 0.38 + (R() - 0.5) * 0.08) * box.h,
+            vx: 0,
+            vy: -22 - R() * 26,
+            size: R() < 0.5 ? 2.5 : 3,
+            color: pick(EMBER_COLORS),
+            age: 0,
+            ttl: 0.3 + R() * 0.15,
+            delay: spread * 0.08,
+            phase: R() * Math.PI * 2,
+            jitter: 0,
+          })
+        }
+      }
+    }
+
+    // Six short-lived acid motes at the contact point: four sizzling bubbles
+    // rising and two heavy droplets sagging downward.
+    function spawnAcidParticles(point) {
+      reserveParticleSlots(6)
+      for (let index = 0; index < 6; index += 1) {
+        const bubbly = index < 4
+        const spread = bubbly ? (index + 0.5) / 4 : (index - 4 + 0.5) / 2
+        if (bubbly) {
+          embers.push({
+            kind: 'acid-bubble',
+            x: point.x + (R() - 0.5) * 10,
+            y: point.y + (R() - 0.5) * 6,
+            vx: (R() - 0.5) * 16,
+            vy: -18 - R() * 24,
+            size: R() < 0.5 ? 2 : 2.5,
+            color: pick(ACID_BUBBLE_COLORS),
+            age: 0,
+            ttl: 0.3 + R() * 0.15,
+            phase: R() * Math.PI * 2,
+          })
+        } else {
+          embers.push({
+            kind: 'acid-drip',
+            x: point.x + (spread - 0.5) * 8 + (R() - 0.5) * 4,
+            y: point.y + (R() - 0.5) * 4,
+            vx: (R() - 0.5) * 6,
+            vy: 28 + R() * 27,
+            size: 2.5,
+            color: pick(ACID_DRIP_COLORS),
+            age: 0,
+            ttl: 0.3 + R() * 0.15,
+            phase: R() * Math.PI * 2,
+          })
+        }
+      }
+    }
+
+    function spawnCyberShards(point) {
+      const count = 5
+      reserveParticleSlots(count)
+      for (let index = 0; index < count; index += 1) {
+        embers.push({
+          kind: 'cyber',
+          x: point.x + (R() - 0.5) * 8,
+          y: point.y + (R() - 0.5) * 10,
+          vx: (R() < 0.5 ? -1 : 1) * 110,
+          width: 4 + R() * 6,
+          height: 1.5,
+          color: GLITCH_SPARK_COLORS[index],
+          age: 0,
+          ttl: 0.12 + R() * 0.06,
+        })
+      }
     }
 
     /** Nearest cached word to a point. No DOM reads. */
@@ -767,13 +905,28 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       queue.add.push([word.id, 'mut-fill'])
     }
 
-    function glitchWord(word) {
+    function effectWord(word, contactPoint) {
       if (!word || word.id == null) return
-      if (now < (glitchUntil.get(word.id) || 0)) return
-      const until = now + GLITCH_MS / 1000 + 0.05
-      glitchUntil.set(word.id, until)
-      activeGlitches.set(word.id, until)
-      queue.add.push([word.id, 'word-glitch-vanish'])
+      if (now < (word.effectUntil || 0)) return
+      const el = cache.els.get(word.id)
+      if (!el) return
+      const duration = 3000 + Math.random() * 1000
+      const durationMs = Math.round(duration)
+      const roll = Math.random()
+      const cls = roll < 0.5 ? 'rw-cyber-glitch' : roll < 0.75 ? 'rw-paper-burn' : 'rw-acid-decay'
+      const glitchColor = cls === 'rw-cyber-glitch' ? pick(NEON_COLORS) : null
+      el.style.setProperty('--effect-duration', `${durationMs}ms`)
+      if (glitchColor) el.style.setProperty('--glitch-color', glitchColor)
+      word.effectUntil = now + durationMs / 1000 + 0.06
+      activeEffects.set(word.id, { until: now + durationMs / 1000 + 0.01, cls })
+      if (cls === 'rw-paper-burn') {
+        spawnPaperParticles(word)
+      } else if (cls === 'rw-cyber-glitch') {
+        spawnCyberShards(contactPoint)
+      } else {
+        spawnAcidParticles(contactPoint)
+      }
+      queue.add.push([word.id, cls])
     }
 
     function sectionIndexAt(wordIndex) {
@@ -856,7 +1009,6 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       flashes.push({ anchor: leg.foot, t: now })
       const word = cache.words[leg.foot.id]
       if (leg.foot.id != null && word) {
-        touchedWords.add(word.id)
         if (gripActive) {
           if (!telemetry.grips.has(word.id)) {
             telemetry.grips.add(word.id)
@@ -1011,7 +1163,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       const maxSpeed = auto ? T.cruise * burst : T.cursor
       const brake = !auto || S.brake
       const want = d > 2 ? mul(to, (brake ? Math.min(maxSpeed, d * 2.2) : maxSpeed) / d) : V()
-      S.v = lerp(S.v, want, damp(auto ? 5 : 3.4, dt))
+      S.v = lerp(S.v, want, damp(auto ? 6.5 : 10, dt))
       S.p = add(S.p, mul(S.v, dt))
 
       const speed = length(S.v)
@@ -1075,22 +1227,68 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
           queue.remove.push([id, 'mut-fill'])
         }
       }
-      for (const [id, until] of activeGlitches) {
-        if (now > until) {
-          activeGlitches.delete(id)
-          glitchUntil.delete(id)
-          queue.remove.push([id, 'word-glitch-vanish'])
+      const endedEffects = new Set()
+      for (const [id, effect] of activeEffects) {
+        if (now > effect.until) {
+          activeEffects.delete(id)
+          endedEffects.add(id)
+          queue.remove.push([id, effect.cls])
+        }
+      }
+      for (let index = embers.length - 1; index >= 0; index -= 1) {
+        const ember = embers[index]
+        if (ember.delay > 0) {
+          ember.delay -= dt
+          continue
+        }
+        ember.age += dt
+        if (ember.age >= ember.ttl) {
+          embers.splice(index, 1)
+          continue
+        }
+        if (ember.kind === 'cyber') {
+          ember.x += ember.vx * dt
+        } else if (ember.kind === 'ash') {
+          ember.x += (ember.vx + Math.sin(now * 7 + ember.phase) * 12) * dt
+          ember.y += ember.vy * dt
+        } else if (ember.kind === 'paper-ember') {
+          // Stepped pixel jitter: snap sideways in whole pixels, never glide.
+          ember.jitter += dt
+          if (ember.jitter >= 0.05) {
+            ember.jitter = 0
+            ember.x += (R() < 0.5 ? -1 : 1) * Math.round(1 + R() * 1.5)
+          }
+          ember.y += ember.vy * dt
+        } else if (ember.kind === 'acid-bubble') {
+          ember.x += (ember.vx + Math.sin(now * 22 + ember.phase) * 7) * dt
+          ember.y += ember.vy * dt
+        } else if (ember.kind === 'acid-drip') {
+          ember.x += ember.vx * dt
+          ember.y += ember.vy * dt
+          ember.vy += 26 * dt
+        } else {
+          ember.x += (ember.vx + Math.sin(now * 26 + ember.phase) * 16) * dt
+          ember.y += ember.vy * dt
+          ember.vy += 8 * dt
         }
       }
       for (let index = flashes.length - 1; index >= 0; index -= 1) {
         if (now - flashes[index].t > 0.3) flashes.splice(index, 1)
       }
 
-      if (frameNumber % 3 === 0) {
-        const headWord = wordAtPoint(add(S.spine[0], mul(forward(), 7 * BODY_S)))
-        if (headWord != null) touchedWords.add(headWord)
-        for (const id of touchedWords) glitchWord(cache.words[id])
-        touchedWords.clear()
+      // Test every current contact point each frame: head, planted feet and
+      // the interpolated tips of legs that are mid-step.
+      const contacts = new Map()
+      const headPoint = add(S.spine[0], mul(forward(), 7 * BODY_S))
+      const headWord = wordNearPoint(headPoint)
+      if (headWord != null) contacts.set(headWord, headPoint)
+      for (const leg of legs) {
+        const footPoint = currentFootPoint(leg)
+        const wordId = wordNearPoint(footPoint)
+        if (wordId != null && !contacts.has(wordId)) contacts.set(wordId, footPoint)
+      }
+      for (const [id, contactPoint] of contacts) {
+        if (!endedEffects.has(id)) effectWord(cache.words[id], contactPoint)
       }
 
       if (now - telemetry.lastFlush >= MEMORY_FLUSH_MS / 1000) flushTelemetry(false)
@@ -1133,6 +1331,20 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       const d = length(delta)
       const max = Math.min(MAX_LEG_LENGTH, leg.L1 + leg.L2)
       return d > max ? add(hip, mul(delta, max / d)) : foot
+    }
+
+    function currentFootPoint(leg) {
+      const hip = hipPos(leg)
+      let foot
+      if (leg.stepping) {
+        const ease = leg.t * leg.t * (3 - 2 * leg.t)
+        const target = leg.next?.id == null ? restPos(leg) : anchorPos(leg.next)
+        foot = lerp(leg.from, target, ease)
+        foot = lerp(foot, hip, Math.sin(Math.PI * leg.t) * 0.18)
+      } else {
+        foot = leg.foot?.id != null ? anchorPos(leg.foot) : restPos(leg)
+      }
+      return clampFoot(hip, foot, leg)
     }
 
     function ik(hip, foot, leg) {
@@ -1213,6 +1425,59 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         ctx.stroke()
       }
 
+      for (const ember of embers) {
+        if (ember.delay > 0) continue
+        const t = clamp(ember.age / ember.ttl, 0, 1)
+        const point = P(ember)
+        if (ember.kind === 'cyber') {
+          ctx.globalAlpha = 1 - t
+          ctx.fillStyle = ember.color
+          ctx.shadowColor = ember.color
+          ctx.shadowBlur = 4 * DR
+          const width = ember.width * (1 - t * 0.2)
+          ctx.fillRect(point.x - width / 2, point.y - ember.height / 2, width, ember.height)
+          continue
+        }
+        // Paper fire and ash are hard square pixels on the integer grid.
+        const pixelX = Math.round(point.x)
+        const pixelY = Math.round(point.y)
+        if (ember.kind === 'acid-bubble') {
+          const size = ember.size
+          ctx.globalAlpha = (1 - t) * 0.9
+          ctx.fillStyle = ember.color
+          ctx.shadowColor = '#BEF264'
+          ctx.shadowBlur = 4 * DR
+          ctx.fillRect(pixelX - size / 2, pixelY - size / 2, size, size)
+          continue
+        }
+        if (ember.kind === 'acid-drip') {
+          ctx.globalAlpha = (1 - t) * 0.85
+          ctx.fillStyle = ember.color
+          ctx.shadowBlur = 0
+          ctx.shadowColor = 'transparent'
+          ctx.fillRect(pixelX - 1, pixelY - 2, 2, 4)
+          continue
+        }
+        if (ember.kind === 'ash') {
+          const size = ember.size
+          ctx.globalAlpha = (1 - t) * 0.7
+          ctx.fillStyle = ember.color
+          ctx.shadowBlur = 0
+          ctx.shadowColor = 'transparent'
+          ctx.fillRect(pixelX - size / 2, pixelY - size / 2, size, size)
+          continue
+        }
+        const size = ember.size
+        ctx.globalAlpha = 1 - t
+        ctx.fillStyle = ember.color
+        ctx.shadowBlur = 0
+        ctx.shadowColor = 'transparent'
+        ctx.fillRect(pixelX - size / 2, pixelY - size / 2, size, size)
+      }
+      ctx.globalAlpha = 1
+      ctx.shadowBlur = 0
+      ctx.shadowColor = 'transparent'
+
       // Exact four-segment articulated oval: head, two thorax ovals, abdomen.
       for (let index = 1; index < BODY_SEGMENTS; index += 1) {
         line(P(S.spine[index - 1]), P(S.spine[index]), 'rgba(143,143,143,.45)', 1)
@@ -1284,7 +1549,6 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       const dt = Math.min(0.05, (time - last) / 1000)
       last = time
       now += dt
-      frameNumber += 1
       update(dt)
       draw()
       commit()
@@ -1324,6 +1588,50 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
   return (
     <div className="relative">
       <canvas ref={canvasRef} className="pointer-events-none fixed inset-0 z-[12]" aria-hidden="true" />
+
+      {/* Progressive acid erosion: turbulence warps and pits the glyph strokes
+          in place, so the word never scales down or changes its layout box. */}
+      <svg
+        width="0"
+        height="0"
+        aria-hidden="true"
+        style={{ position: 'absolute', pointerEvents: 'none' }}
+      >
+        <filter id="acid-erode-1" x="-10%" y="-10%" width="120%" height="120%">
+          <feTurbulence type="fractalNoise" baseFrequency="0.18" numOctaves="3" seed="4" result="noise" />
+          <feDisplacementMap
+            in="SourceGraphic"
+            in2="noise"
+            scale="4"
+            xChannelSelector="R"
+            yChannelSelector="G"
+          />
+        </filter>
+        <filter id="acid-erode-2" x="-12%" y="-12%" width="124%" height="124%">
+          <feTurbulence type="fractalNoise" baseFrequency="0.22" numOctaves="3" seed="9" result="noise" />
+          <feDisplacementMap
+            in="SourceGraphic"
+            in2="noise"
+            scale="9"
+            xChannelSelector="R"
+            yChannelSelector="G"
+            result="warped"
+          />
+          <feMorphology in="warped" operator="erode" radius="0.9" />
+        </filter>
+        <filter id="acid-erode-3" x="-15%" y="-15%" width="130%" height="130%">
+          <feTurbulence type="fractalNoise" baseFrequency="0.28" numOctaves="3" seed="15" result="noise" />
+          <feDisplacementMap
+            in="SourceGraphic"
+            in2="noise"
+            scale="15"
+            xChannelSelector="R"
+            yChannelSelector="G"
+            result="warped"
+          />
+          <feMorphology in="warped" operator="erode" radius="1.6" />
+        </filter>
+      </svg>
 
       <div className={`transition-[padding] duration-300 ${drawerOpen ? 'lg:pr-[352px]' : ''}`}>
         <article className="mx-auto w-full max-w-[720px] px-5 pb-52 pt-8 sm:px-8">
