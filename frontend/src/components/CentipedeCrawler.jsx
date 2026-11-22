@@ -240,6 +240,19 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
   telemetryHandlerRef.current = onTelemetry
 
   const telemetryStateRef = useRef(null)
+
+  // Audio lives entirely in refs. Nothing here is read or written by the
+  // requestAnimationFrame effect's closure setup, so toggling sound or firing
+  // a synthesised hit can never restart, remount or block the movement loop.
+  const audioCtxRef = useRef(null)
+  const noiseBufRef = useRef(null)
+  const masterBusRef = useRef(null)
+  const soundEnabledRef = useRef(true)
+  const lastBlankSoundRef = useRef(-1)
+  const lastWordSoundRef = useRef(-1)
+  const [soundEnabled, setSoundEnabled] = useState(true)
+  soundEnabledRef.current = soundEnabled
+
   const [rows, setRows] = useState([])
   const [drawerOpen, setDrawerOpen] = useState(
     () => typeof window === 'undefined' || window.matchMedia('(min-width: 1024px)').matches,
@@ -361,6 +374,189 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       window.removeEventListener('scroll', onScroll)
     }
   }, [])
+
+  // Lazily builds the clean unity master bus once: gain -> output.
+  // Swallows every failure so a blocked or unsupported AudioContext is silent.
+  function ensureAudioBus() {
+    try {
+      if (typeof window === 'undefined') return null
+      const AudioCtor = window.AudioContext || window.webkitAudioContext
+      if (!AudioCtor) return null
+      let ctx = audioCtxRef.current
+      if (!ctx) {
+        ctx = new AudioCtor()
+        audioCtxRef.current = ctx
+
+        const frames = Math.max(1, Math.floor(ctx.sampleRate * 0.02))
+        const buffer = ctx.createBuffer(1, frames, ctx.sampleRate)
+        const channel = buffer.getChannelData(0)
+        for (let index = 0; index < frames; index += 1) channel[index] = Math.random() * 2 - 1
+        noiseBufRef.current = buffer
+
+        const master = ctx.createGain()
+        master.gain.value = 0.85
+
+        master.connect(ctx.destination)
+        masterBusRef.current = master
+
+        const resume = () => {
+          try {
+            const current = audioCtxRef.current
+            if (current && current.state === 'suspended') current.resume()
+          } catch {
+            /* audio is optional */
+          }
+        }
+        window.addEventListener('pointerdown', resume, { passive: true })
+        window.addEventListener('keydown', resume)
+      }
+      if (ctx.state === 'suspended') {
+        const resumed = ctx.resume()
+        if (resumed && typeof resumed.catch === 'function') resumed.catch(() => {})
+      }
+      return ctx
+    } catch {
+      return null
+    }
+  }
+
+  // Layer 1: soft liquid tactile foot tap for a leg planting on blank surface.
+  function playBlankTap(panX) {
+    try {
+      if (!soundEnabledRef.current) return
+      const ctx = ensureAudioBus()
+      const bus = masterBusRef.current
+      if (!ctx || !bus) return
+      const start = ctx.currentTime
+      if (start - lastBlankSoundRef.current < 0.022) return
+      lastBlankSoundRef.current = start
+
+      const panner = ctx.createStereoPanner()
+      panner.pan.value = Math.max(-0.65, Math.min(0.65, Number.isFinite(panX) ? panX : 0))
+      panner.connect(bus)
+
+      const noise = ctx.createBufferSource()
+      noise.buffer = noiseBufRef.current
+      const filter = ctx.createBiquadFilter()
+      filter.type = 'bandpass'
+      filter.frequency.value = 2400
+      filter.Q.value = 3.2
+      const noiseGain = ctx.createGain()
+      noiseGain.gain.setValueAtTime(0.0001, start)
+      noiseGain.gain.linearRampToValueAtTime(0.085, start + 0.001)
+      noiseGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.016)
+      noise.connect(filter)
+      filter.connect(noiseGain)
+      noiseGain.connect(panner)
+      noise.start(start)
+      noise.stop(start + 0.018)
+      noise.onended = () => {
+        try {
+          noise.disconnect()
+          filter.disconnect()
+          noiseGain.disconnect()
+        } catch {
+          /* node already released */
+        }
+      }
+
+      const thump = ctx.createOscillator()
+      thump.type = 'sine'
+      const thumpGain = ctx.createGain()
+      thump.frequency.setValueAtTime(340, start)
+      thump.frequency.exponentialRampToValueAtTime(135, start + 0.018)
+      thumpGain.gain.setValueAtTime(0.075, start)
+      thumpGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.018)
+      thump.connect(thumpGain)
+      thumpGain.connect(panner)
+      thump.start(start)
+      thump.stop(start + 0.018)
+      thump.onended = () => {
+        try {
+          thump.disconnect()
+          thumpGain.disconnect()
+          panner.disconnect()
+        } catch {
+          /* node already released */
+        }
+      }
+    } catch {
+      /* audio must never touch the animation frame */
+    }
+  }
+
+  // Layer 2: clean liquid bleep at a random, deliberately non-musical pitch.
+  function playWordContactBleep(panX) {
+    try {
+      if (!soundEnabledRef.current) return
+      const ctx = ensureAudioBus()
+      const bus = masterBusRef.current
+      if (!ctx || !bus) return
+      const start = ctx.currentTime
+      if (start - lastWordSoundRef.current < 0.026) return
+      lastWordSoundRef.current = start
+
+      const panner = ctx.createStereoPanner()
+      panner.pan.value = Math.max(-1, Math.min(1, Number.isFinite(panX) ? panX : 0))
+      panner.connect(bus)
+
+      const freq = 290 + Math.random() * 1060
+
+      const bleep = ctx.createOscillator()
+      bleep.type = 'sine'
+      const harmonic = ctx.createOscillator()
+      harmonic.type = 'triangle'
+      const harmonicGain = ctx.createGain()
+      harmonicGain.gain.value = 0.15
+      const bleepGain = ctx.createGain()
+
+      bleep.frequency.setValueAtTime(freq * 0.72, start)
+      bleep.frequency.exponentialRampToValueAtTime(freq * 1.15, start + 0.042)
+      harmonic.frequency.setValueAtTime(freq * 0.72 * 1.5, start)
+      harmonic.frequency.exponentialRampToValueAtTime(freq * 1.15 * 1.5, start + 0.042)
+
+      bleepGain.gain.setValueAtTime(0.0001, start)
+      bleepGain.gain.linearRampToValueAtTime(0.11, start + 0.003)
+      bleepGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.048)
+
+      bleep.connect(bleepGain)
+      harmonic.connect(harmonicGain)
+      harmonicGain.connect(bleepGain)
+      bleepGain.connect(panner)
+
+      bleep.start(start)
+      harmonic.start(start)
+      bleep.stop(start + 0.05)
+      harmonic.stop(start + 0.05)
+      bleep.onended = () => {
+        try {
+          bleep.disconnect()
+          harmonic.disconnect()
+          harmonicGain.disconnect()
+          bleepGain.disconnect()
+          panner.disconnect()
+        } catch {
+          /* node already released */
+        }
+      }
+    } catch {
+      /* audio must never touch the animation frame */
+    }
+  }
+
+  useEffect(
+    () => () => {
+      try {
+        audioCtxRef.current?.close()
+      } catch {
+        /* nothing to release */
+      }
+      audioCtxRef.current = null
+      noiseBufRef.current = null
+      masterBusRef.current = null
+    },
+    [],
+  )
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -511,6 +707,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
     const queue = { add: [], remove: [], fill: [] }
     const activeEffects = new Map()
     const claimedWordIndices = new Set()
+    const touchedWordIds = new Set()
     const telemetry =
       telemetryStateRef.current ||
       (telemetryStateRef.current = {
@@ -1008,6 +1205,11 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       leg.next = null
       flashes.push({ anchor: leg.foot, t: now })
       const word = cache.words[leg.foot.id]
+      // Layer 1: no `.rw` word under the foot means a blank-surface tap.
+      if (leg.foot.id == null || !word) {
+        const plantPoint = anchorPos(leg.foot)
+        playBlankTap(W > 0 ? (plantPoint.x - (window.scrollX + W / 2)) / (W / 2) : 0)
+      }
       if (leg.foot.id != null && word) {
         if (gripActive) {
           if (!telemetry.grips.has(word.id)) {
@@ -1286,6 +1488,18 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         const footPoint = currentFootPoint(leg)
         const wordId = wordNearPoint(footPoint)
         if (wordId != null && !contacts.has(wordId)) contacts.set(wordId, footPoint)
+      }
+      // Layer 2 fires on contact onset, not on every frame a foot rests on the
+      // same word, so a planted leg bleeps once instead of buzzing.
+      for (const [id, contactPoint] of contacts) {
+        if (touchedWordIds.has(id)) continue
+        touchedWordIds.add(id)
+        playWordContactBleep(
+          W > 0 ? (contactPoint.x - (window.scrollX + W / 2)) / (W / 2) : 0,
+        )
+      }
+      for (const id of touchedWordIds) {
+        if (!contacts.has(id)) touchedWordIds.delete(id)
       }
       for (const [id, contactPoint] of contacts) {
         if (!endedEffects.has(id)) effectWord(cache.words[id], contactPoint)
@@ -1723,6 +1937,35 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
           )}
         </div>
       </aside>
+
+      <button
+        type="button"
+        onClick={(event) => {
+          event.stopPropagation()
+          const next = !soundEnabledRef.current
+          soundEnabledRef.current = next
+          setSoundEnabled(next)
+          if (next) ensureAudioBus()
+        }}
+        aria-pressed={soundEnabled}
+        aria-label={soundEnabled ? 'Mute crawler sound' : 'Enable crawler sound'}
+        title={soundEnabled ? 'Mute crawler sound' : 'Enable crawler sound'}
+        className="fixed bottom-[112px] right-4 z-30 grid h-8 w-8 place-items-center rounded-full border border-[#2F2F2F] bg-[#171717] text-[#9B9B9B] transition hover:bg-[#2A2A2A] hover:text-[#ECECEC] sm:right-6"
+      >
+        {soundEnabled ? (
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+            <path d="M4 9.5h3L12 6v12l-5-3.5H4z" />
+            <path d="M16 9a4 4 0 0 1 0 6" />
+            <path d="M18.5 6.5a7.5 7.5 0 0 1 0 11" />
+          </svg>
+        ) : (
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+            <path d="M4 9.5h3L12 6v12l-5-3.5H4z" />
+            <path d="m16 9.5 5 5" />
+            <path d="m21 9.5-5 5" />
+          </svg>
+        )}
+      </button>
     </div>
   )
 }
