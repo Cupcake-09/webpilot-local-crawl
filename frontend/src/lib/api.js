@@ -128,11 +128,11 @@ export async function generateVisuals({ query, markdown, source, rows = [], memo
 }
 
 /** POST /api/generate-podcast → takeaways + Host A / Host B dialogue. */
-export async function generatePodcast({ query, markdown, rows = [], settings }) {
+export async function generatePodcast({ query, markdown, rows = [], memory = null, settings }) {
   const res = await fetch(`${API_BASE}/api/generate-podcast`, {
     method: 'POST',
     headers: jsonHeaders(settings),
-    body: JSON.stringify({ query, markdown, rows }),
+    body: JSON.stringify({ query, markdown, rows, memory }),
   })
 
   if (!res.ok) throw new Error(await readError(res))

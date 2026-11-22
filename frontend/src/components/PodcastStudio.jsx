@@ -12,9 +12,14 @@ function formatTime(value) {
   return `${minutes}:${String(seconds).padStart(2, '0')}`
 }
 
-export default function PodcastStudio({ podcast, busy, error, research }) {
+export default function PodcastStudio({ podcast, busy, error, research, spiderMemory }) {
   const lines = podcast?.dialogue || []
   const takeaways = podcast?.takeaways || []
+  const crawled = spiderMemory?.stats
+  const crawledLabel =
+    crawled && (crawled.concepts || crawled.sections)
+      ? `Grounded in ${crawled.concepts} spider-foraged ${crawled.concepts === 1 ? 'concept' : 'concepts'} across ${crawled.sections} ${crawled.sections === 1 ? 'section' : 'sections'}`
+      : ''
 
   const [playing, setPlaying] = useState(false)
   const [preparing, setPreparing] = useState(false)
@@ -239,6 +244,12 @@ export default function PodcastStudio({ podcast, busy, error, research }) {
           <p className="mt-1 text-[12.5px] leading-6 text-[#9B9B9B]">
             Pooled takeaways and a two-host conversation, generated from the last research run.
           </p>
+          {crawledLabel ? (
+            <p className="mt-3 inline-flex max-w-full items-center gap-2 rounded-full border border-[#2F2F2F] bg-[#171717] px-3 py-1 text-[11px] text-[#9B9B9B]">
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#38BDF8]" />
+              <span className="truncate">{crawledLabel}</span>
+            </p>
+          ) : null}
 
           <div className="mt-5 rounded-xl border border-[#2F2F2F] bg-[#171717] p-4">
             <p className="text-[12.5px] text-[#9B9B9B]">{playerMeta}</p>

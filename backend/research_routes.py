@@ -45,6 +45,7 @@ class PodcastRequest(BaseModel):
     query: str = ""
     markdown: str = ""
     rows: list[dict] = []
+    memory: dict | None = None
 
 
 class PodcastLine(BaseModel):
@@ -251,8 +252,11 @@ async def generate_visuals(req: VisualRequest):
     for item in (memory.get("sections") if isinstance(memory.get("sections"), list) else [])[-12:]:
         if not isinstance(item, dict):
             continue
-        title = str(item.get("section") or "Section").strip()[:48] or "Section"
-        entities = [str(entity).strip()[:80] for entity in (item.get("lockedEntities") or []) if str(entity).strip()][:8]
+        title = str(item.get("section") or item.get("heading") or "Section").strip()[:48] or "Section"
+        raw_entities = item.get("lockedEntities") or item.get("concepts") or []
+        entities = [str(entity).strip()[:80] for entity in raw_entities if str(entity).strip()][:8]
+        raw_metrics = item.get("metrics") if isinstance(item.get("metrics"), list) else []
+        metrics = [str(metric).strip()[:40] for metric in raw_metrics if str(metric).strip()][:8]
         memory_sections.append(
             {
                 "title": title,
@@ -260,8 +264,29 @@ async def generate_visuals(req: VisualRequest):
                 "gripCount": _safe_int(item.get("gripCount")),
                 "words": _safe_int(item.get("words")),
                 "entities": entities,
+                "metrics": metrics,
+                "topScore": _safe_float(item.get("topScore")),
             }
         )
+    memory_top = []
+    for item in (memory.get("topConcepts") if isinstance(memory.get("topConcepts"), list) else []):
+        if isinstance(item, dict):
+            label = str(item.get("word") or "").strip()[:60]
+            score = _safe_float(item.get("score"))
+        else:
+            label = str(item or "").strip()[:60]
+            score = 0.0
+        if label:
+            memory_top.append({"label": label, "score": score})
+    memory_metrics = []
+    for item in (memory.get("metrics") if isinstance(memory.get("metrics"), list) else []):
+        label = str(item or "").strip()[:40]
+        if label and label not in memory_metrics:
+            memory_metrics.append(label)
+    for section in memory_sections:
+        for metric in section["metrics"]:
+            if metric not in memory_metrics:
+                memory_metrics.append(metric)
     memory_edges = []
     for edge in (memory.get("traversalEdges") if isinstance(memory.get("traversalEdges"), list) else [])[:25]:
         if not isinstance(edge, dict):
@@ -337,7 +362,14 @@ async def generate_visuals(req: VisualRequest):
         for section in memory_sections:
             for entity in section["entities"]:
                 grip_counts[entity] = grip_counts.get(entity, 0) + max(1, section["gripCount"])
-        if grip_counts:
+        if memory_top:
+            bar_title = "Spider-foraged concepts"
+            bar_unit = "salience"
+            bar_series = [
+                {"label": item["label"], "value": max(1, round(item["score"] * 10))}
+                for item in memory_top[:6]
+            ]
+        elif grip_counts:
             bar_title = "Gripped concepts"
             bar_unit = "grips"
             bar_series = [
@@ -390,11 +422,15 @@ async def generate_visuals(req: VisualRequest):
     source = (req.source or "research").strip()
     memory_summary = ""
     if memory_sections:
+        total_grips = _safe_int(memory.get("gripCount")) or sum(section["gripCount"] for section in memory_sections)
+        total_dwell = _safe_float(memory.get("dwellMs")) or sum(section["dwellMs"] for section in memory_sections)
         memory_summary = (
-            f" Crawler telemetry retained {_safe_int(memory.get('gripCount')):,} grips and "
-            f"{round(_safe_float(memory.get('dwellMs')) / 1000, 1):,.1f}s of dwell across "
+            f" Crawler telemetry retained {total_grips:,} grips and "
+            f"{round(total_dwell / 1000, 1):,.1f}s of dwell across "
             f"{len(memory_sections)} sections."
         )
+        if memory_metrics:
+            memory_summary += f" {len(memory_metrics)} quantitative metrics were foraged."
     return {
         "status": "success",
         "summary": (
@@ -414,7 +450,49 @@ async def generate_visuals(req: VisualRequest):
     }
 
 
-def _fallback_podcast(query: str, markdown: str):
+def _memory_concepts(memory) -> list[str]:
+    if not isinstance(memory, dict):
+        return []
+    concepts = []
+    for item in (memory.get("topConcepts") if isinstance(memory.get("topConcepts"), list) else []):
+        label = item.get("word") if isinstance(item, dict) else item
+        label = str(label or "").strip()[:60]
+        if label and label.lower() not in {value.lower() for value in concepts}:
+            concepts.append(label)
+    return concepts[:12]
+
+
+def _memory_digest(memory) -> str:
+    """Compact section -> concept -> metric structure for the podcast prompt."""
+    if not isinstance(memory, dict):
+        return ""
+    formatted = str(memory.get("formattedContext") or "").strip()
+    if formatted:
+        return formatted[:3000]
+    lines = []
+    concepts = _memory_concepts(memory)
+    if concepts:
+        lines.append("Top concepts: " + ", ".join(concepts))
+    for item in (memory.get("sections") if isinstance(memory.get("sections"), list) else [])[-12:]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("heading") or item.get("section") or "").strip()[:60]
+        raw_concepts = item.get("concepts") or item.get("lockedEntities") or []
+        section_concepts = [str(value).strip()[:60] for value in raw_concepts if str(value).strip()][:8]
+        raw_metrics = item.get("metrics") if isinstance(item.get("metrics"), list) else []
+        metrics = [str(value).strip()[:40] for value in raw_metrics if str(value).strip()][:6]
+        if not title and not section_concepts:
+            continue
+        line = f"- {title or 'Section'}"
+        if section_concepts:
+            line += ": " + ", ".join(section_concepts)
+        if metrics:
+            line += f" | metrics: {', '.join(metrics)}"
+        lines.append(line)
+    return "\n".join(lines)[:3000]
+
+
+def _fallback_podcast(query: str, markdown: str, concepts: list[str] | None = None):
     q = re.sub(r"\s+", " ", (query or "this research")).strip()
     sentences = _split_sentences(markdown)
     terms = {label for label, _ in _keywords(markdown, 10)}
@@ -429,6 +507,9 @@ def _fallback_podcast(query: str, markdown: str):
         "Context changes the size of the effect more than its direction.",
         "Replication and transparent measurement carry the most weight.",
     ]
+    if concepts:
+        # Keep the crawl visible even when no LLM is configured.
+        takeaways = takeaways[:3] + [f"The spider kept returning to {', '.join(concepts[:5])}."]
 
     dialogue = [
         {"speaker": "Host A", "text": f"Today we are unpacking {q}. The brief is long, so let's start with the one-line version. What actually holds up?"},
@@ -448,15 +529,25 @@ def _fallback_podcast(query: str, markdown: str):
 @router.post("/api/generate-podcast")
 async def generate_podcast(req: PodcastRequest, request: Request):
     query = (req.query or "this research").strip()
-    takeaways, dialogue = _fallback_podcast(query, req.markdown or "")
+    focus_concepts = _memory_concepts(req.memory)
+    digest = _memory_digest(req.memory)
+    takeaways, dialogue = _fallback_podcast(query, req.markdown or "", focus_concepts)
 
     base_url, api_key, model = _resolve_llm(request)
     if api_key and api_key != "local":
+        focus_block = (
+            "\nSpider-foraged focus: the crawler dwelled in these sections and returned to these "
+            f"concepts most often. Emphasise them and keep the structure visible.\n{digest}\n"
+            if digest
+            else ""
+        )
         prompt = (
             "Create a short two-host podcast script grounded only in the supplied research text. "
             'Return ONE JSON object: {"takeaways": [4 strings], "dialogue": [{"speaker": "Host A" or "Host B", '
             '"text": string}]}. Use 8 to 10 alternating turns, natural spoken sentences, no markdown, '
-            f"no stage directions.\n\nQuestion: {query}\n\nResearch:\n{(req.markdown or '')[:9000]}"
+            "no stage directions.\n\nQuestion: "
+            f"{query}\n"
+            f"{focus_block}\nResearch:\n{(req.markdown or '')[:9000]}"
         )
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:

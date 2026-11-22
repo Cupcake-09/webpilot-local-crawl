@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import CentipedeCrawler from './components/CentipedeCrawler.jsx'
 import JuliusNapkin from './components/JuliusNapkin.jsx'
 import MemoryModal from './components/MemoryModal.jsx'
@@ -16,6 +16,7 @@ import {
   saveInsectMemory,
 } from './lib/insectMemory.js'
 import { loadLlmSettings, llmLabel } from './lib/llm.js'
+import { formatInsectMemory } from './utils/formatInsectMemory.js'
 
 const VIEWS = [
   { id: 'research', label: 'Research', description: 'Reading stage', icon: 'compass' },
@@ -114,6 +115,7 @@ export default function App() {
   const [podcast, setPodcast] = useState(null)
   const [podcastBusy, setPodcastBusy] = useState(false)
   const [podcastError, setPodcastError] = useState('')
+  const [chartScope, setChartScope] = useState('spider')
   const [history, setHistory] = useState([])
   const [draft, setDraft] = useState('')
   const [notice, setNotice] = useState('')
@@ -126,6 +128,9 @@ export default function App() {
   const memorySession = activeSession(memory)
   const memoryEntities = entityCount(memorySession)
   const memoryGrips = gripTotal(memorySession)
+  // Structured, section-grouped view of what the spider actually foraged.
+  // Recomputed whenever memory changes so both tabs stay in step with the crawl.
+  const spiderMemory = useMemo(() => formatInsectMemory(memoryForVisuals(memory)), [memory])
 
   const commitMemory = (next) => {
     memoryRef.current = next
@@ -156,20 +161,17 @@ export default function App() {
     })
   }
 
-  const runGenerators = (id, markdown, meta, snapshot, memoryState) => {
-    setVisuals(null)
-    setPodcast(null)
-    setVisualsError('')
-    setPodcastError('')
+  const generateCharts = (id, markdown, meta, snapshot, memoryState, scope = 'spider') => {
     setVisualsBusy(true)
-    setPodcastBusy(true)
-
+    setVisualsError('')
     generateVisuals({
       query: meta.query,
       markdown,
       source: meta.source,
       settings: snapshot,
-      memory: memoryForVisuals(memoryState),
+      // Spider scope hands the engine the crawled semantic payload; full scope
+      // sends no memory so it falls back to the raw essay text.
+      memory: scope === 'spider' ? formatInsectMemory(memoryForVisuals(memoryState)) : null,
     })
       .then((data) => {
         if (sequenceRef.current === id) setVisuals(data)
@@ -180,10 +182,29 @@ export default function App() {
       .finally(() => {
         if (sequenceRef.current === id) setVisualsBusy(false)
       })
+  }
+
+  const regenerateCharts = (scope) => {
+    const current = research
+    if (!current) return
+    setChartScope(scope)
+    generateCharts(current.id, current.markdown, { query: current.query, source: current.source }, settings, memoryRef.current, scope)
+  }
+
+  const runGenerators = (id, markdown, meta, snapshot, memoryState) => {
+    setVisuals(null)
+    setPodcast(null)
+    setVisualsError('')
+    setPodcastError('')
+    setChartScope('spider')
+    setPodcastBusy(true)
+
+    generateCharts(id, markdown, meta, snapshot, memoryState, 'spider')
 
     generatePodcast({
       query: meta.query,
       markdown,
+      memory: formatInsectMemory(memoryForVisuals(memoryState)),
       settings: snapshot,
     })
       .then((data) => {
@@ -499,9 +520,23 @@ export default function App() {
         ) : (
           <main className="mx-auto w-full max-w-[1120px] px-3 pb-44 pt-6 sm:px-5">
             {view === 'julius' ? (
-              <JuliusNapkin visuals={visuals} busy={visualsBusy} error={visualsError} research={research} />
+              <JuliusNapkin
+                visuals={visuals}
+                busy={visualsBusy}
+                error={visualsError}
+                research={research}
+                spiderMemory={spiderMemory}
+                scope={chartScope}
+                onRegenerate={regenerateCharts}
+              />
             ) : (
-              <PodcastStudio podcast={podcast} busy={podcastBusy} error={podcastError} research={research} />
+              <PodcastStudio
+                podcast={podcast}
+                busy={podcastBusy}
+                error={podcastError}
+                research={research}
+                spiderMemory={spiderMemory}
+              />
             )}
           </main>
         )}

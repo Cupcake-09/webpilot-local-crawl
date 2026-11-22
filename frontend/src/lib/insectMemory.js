@@ -14,6 +14,8 @@ export const MAX_SECTIONS = 12
 export const MAX_ENTITIES = 25
 export const MAX_EDGES = 25
 export const MAX_SESSIONS = 8
+export const MAX_GRIPS = 120
+export const MAX_TOP_CONCEPTS = 20
 export const MEMORY_FLUSH_MS = 1500
 export const MEMORY_STORAGE_KEY = 'webpilot.insect-memory.v1'
 export const TOKENS_PER_WORD = MAX_MEMORY_TOKENS / MAX_MEMORY_WORDS
@@ -48,6 +50,59 @@ function normaliseEntityList(value) {
     if (entities.length >= MAX_ENTITIES) break
   }
   return entities
+}
+
+function normaliseGrip(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const word = text(raw.word ?? raw.entity, 80)
+  if (!word) return null
+  const rawScore = Number(raw.score)
+  return {
+    word,
+    score: Number.isFinite(rawScore) ? Math.round(rawScore * 100) / 100 : 0,
+    sectionHeading: text(raw.sectionHeading ?? raw.section, 80) || 'General Context',
+    clusterId: text(raw.clusterId, 80),
+    timestamp: stamp(raw.timestamp),
+  }
+}
+
+/** Newest-bounded, deduplicated grip log; higher salience wins a repeat. */
+function mergeGrips(previous, incoming) {
+  const byKey = new Map()
+  for (const raw of [...(Array.isArray(previous) ? previous : []), ...(Array.isArray(incoming) ? incoming : [])]) {
+    const grip = normaliseGrip(raw)
+    if (!grip) continue
+    const key = `${grip.word.toLowerCase()}\u0000${grip.sectionHeading.toLowerCase()}`
+    const prior = byKey.get(key)
+    byKey.set(
+      key,
+      prior
+        ? {
+            ...prior,
+            score: Math.max(prior.score, grip.score),
+            timestamp: Math.max(prior.timestamp, grip.timestamp),
+            clusterId: grip.clusterId || prior.clusterId,
+          }
+        : grip,
+    )
+  }
+  return [...byKey.values()]
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .slice(-MAX_GRIPS)
+}
+
+function normaliseConceptList(value) {
+  const seen = new Set()
+  const concepts = []
+  for (const item of Array.isArray(value) ? value : []) {
+    const label = text(typeof item === 'string' ? item : item?.word, 80)
+    const key = label.toLowerCase()
+    if (!label || seen.has(key)) continue
+    seen.add(key)
+    concepts.push(label)
+    if (concepts.length >= MAX_TOP_CONCEPTS) break
+  }
+  return concepts
 }
 
 function normaliseSection(raw) {
@@ -141,6 +196,8 @@ function normaliseSession(raw) {
     gripCount: count(raw.gripCount) || sections.reduce((sum, item) => sum + item.gripCount, 0),
     sections,
     traversalEdges: mergeEdges([], raw.traversalEdges),
+    grips: mergeGrips([], raw.grips),
+    topConcepts: normaliseConceptList(raw.topConcepts),
   }
 }
 
@@ -190,6 +247,8 @@ function mergeSession(previous, snapshot) {
     gripCount: Math.max(previous.gripCount, incoming.gripCount),
     sections,
     traversalEdges: mergeEdges(previous.traversalEdges, incoming.traversalEdges),
+    grips: mergeGrips(previous.grips, incoming.grips),
+    topConcepts: normaliseConceptList([...(previous.topConcepts ?? []), ...(incoming.topConcepts ?? [])]),
   }
 }
 
@@ -244,6 +303,8 @@ export function beginMemorySession(memory, meta = {}) {
     gripCount: previous?.gripCount ?? 0,
     sections: previous?.sections ?? [],
     traversalEdges: previous?.traversalEdges ?? [],
+    grips: previous?.grips ?? [],
+    topConcepts: previous?.topConcepts ?? [],
   }
   return putSession(state, session)
 }
@@ -308,6 +369,8 @@ export function exportActiveSession(memory) {
     entityCount: entityCount(session),
     sections: session.sections,
     traversalEdges: session.traversalEdges,
+    grips: session.grips ?? [],
+    topConcepts: session.topConcepts ?? [],
   }
 }
 

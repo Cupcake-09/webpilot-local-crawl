@@ -77,13 +77,29 @@ function parseReading(markdown, streaming) {
   let nextId = 0
   let inCode = false
 
-  const addWords = (text, narrative) => {
+  const addWords = (text, narrative, strong = false) => {
     const ids = []
     for (const token of text.split(/\s+/)) {
       if (!token) continue
       const id = nextId++
-      words.push({ id, text: token, filler: isFiller(token), narrative, sentence: null })
+      words.push({ id, text: token, filler: isFiller(token), narrative, strong, sentence: null })
       ids.push(id)
+    }
+    return ids
+  }
+
+  // Emphasis is stripped before tokenising, so recover the bold/strong flag
+  // first: it is one of the semantic signals the steering brain reads.
+  const BOLD_SPAN = /(\*\*[^*]+\*\*|__[^_]+__)/
+  const addRichWords = (raw, narrative) => {
+    const ids = []
+    for (const part of raw.split(BOLD_SPAN)) {
+      if (!part) continue
+      const bold =
+        (part.startsWith('**') && part.endsWith('**') && part.length > 4) ||
+        (part.startsWith('__') && part.endsWith('__') && part.length > 4)
+      const cleaned = stripInline(bold ? part.slice(2, -2) : part)
+      if (cleaned) ids.push(...addWords(cleaned, narrative, bold))
     }
     return ids
   }
@@ -108,14 +124,14 @@ function parseReading(markdown, streaming) {
     }
     const list = trimmed.match(/^[-*+]\s+(.*)$/) || trimmed.match(/^\d+[.)]\s+(.*)$/)
     if (list) {
-      blocks.push({ type: 'li', wordIds: addWords(stripInline(list[1]), true) })
+      blocks.push({ type: 'li', wordIds: addRichWords(list[1], true) })
       continue
     }
     if (/^>\s?/.test(trimmed)) {
-      blocks.push({ type: 'quote', wordIds: addWords(stripInline(trimmed.replace(/^>\s?/, '')), true) })
+      blocks.push({ type: 'quote', wordIds: addRichWords(trimmed.replace(/^>\s?/, ''), true) })
       continue
     }
-    blocks.push({ type: 'p', wordIds: addWords(stripInline(trimmed), true) })
+    blocks.push({ type: 'p', wordIds: addRichWords(trimmed, true) })
   }
 
   const sentences = []
@@ -240,6 +256,22 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
   telemetryHandlerRef.current = onTelemetry
 
   const telemetryStateRef = useRef(null)
+
+  // Silent semantic steering brain. Every field is mutated in place by the
+  // movement loop, so changing targets never restarts or remounts the effect.
+  // Nothing in here is ever drawn: the lock-on is purely internal.
+  const navBrainRef = useRef({
+    evaluatedAt: -1,
+    target: null,
+    targetId: null,
+    clusterId: null,
+    clusterWordIds: [],
+    scores: new Map(),
+    keywords: new Set(),
+    headings: new Map(),
+    gripLog: [],
+    topConcepts: [],
+  })
 
   // Audio lives entirely in refs. Nothing here is read or written by the
   // requestAnimationFrame effect's closure setup, so toggling sound or firing
@@ -1130,6 +1162,197 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       return cache.wordSection[clamp(wordIndex, 0, Math.max(0, cache.words.length - 1))] ?? 0
     }
 
+    // --- Dynamic semantic steering ------------------------------------------
+    // Candidates are scored and locked silently; the brain only ever writes
+    // S.target, so no sightline, reticle or highlight is introduced.
+    const NAV_EVAL_INTERVAL = 0.45
+    const CLUSTER_RADIUS = 110
+    const TRAVEL_DECAY = 0.012
+    const HIGH_VALUE = 3.5
+    const KEYWORD_MIN = 4
+
+    function queryKeywords() {
+      const raw = `${metaRef.current.query || ''}`.toLowerCase()
+      const keywords = new Set()
+      for (const token of raw.split(/[^a-z0-9]+/)) {
+        if (token.length < KEYWORD_MIN || STOPWORDS.has(token)) continue
+        keywords.add(token)
+      }
+      return keywords
+    }
+
+    function matchesKeywords(word) {
+      const keywords = navBrainRef.current.keywords
+      if (!keywords.size) return false
+      const token = word.text.toLowerCase().replace(/[^a-z0-9-]/g, '')
+      if (!token) return false
+      for (const keyword of keywords) {
+        if (token === keyword) return true
+        // Loose stemming keeps "navigate" and "navigation" in the same cluster.
+        if (keyword.length >= 5 && (token.startsWith(keyword) || keyword.startsWith(token))) return true
+      }
+      return false
+    }
+
+    /** Nearest preceding h1/h2/h3 text, cached per block. */
+    function headingForWord(id) {
+      const brain = navBrainRef.current
+      const blockIndex = cache.wordBlock[id] ?? 0
+      if (brain.headings.has(blockIndex)) return brain.headings.get(blockIndex)
+      let heading = 'General Context'
+      for (let index = blockIndex; index >= 0; index -= 1) {
+        const block = cache.blocks[index]
+        if (!block || !/^h[1-3]$/.test(block.type)) continue
+        const title = block.wordIds
+          .map((wordId) => cache.words[wordId]?.text || '')
+          .join(' ')
+          .trim()
+        if (title) {
+          heading = title.slice(0, 120)
+          break
+        }
+      }
+      brain.headings.set(blockIndex, heading)
+      return heading
+    }
+
+    /** Intrinsic semantic value of one word, capped to the +4..+8 band. */
+    function semanticValue(word, id) {
+      if (!word) return -3
+      const block = cache.blocks[cache.wordBlock[id] ?? -1]
+      const type = block?.type || 'p'
+      let value = 0
+      if (type === 'h1') value += 6
+      else if (type === 'h2' || type === 'h3') value += 5
+      if (word.strong) value += 4
+      const token = word.text.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '')
+      if (/^[A-Z][A-Za-z0-9-]{2,}$/.test(token)) value += 4
+      if (/\d/.test(word.text)) value += 2
+      if (!word.filler && matchesKeywords(word)) value += 6
+      if (word.filler) value -= 3
+      return Math.min(8, value)
+    }
+
+    /** Value + cluster cohesion - travel cost. Position is never drawn. */
+    function scoreWordCandidate(candidate, highValue) {
+      let cohesion = 0
+      for (const other of highValue) {
+        if (other.id === candidate.id) continue
+        if (distance(candidate.centre, other.centre) <= CLUSTER_RADIUS) cohesion += 1.5
+      }
+      const travel = distance(candidate.centre, S.p)
+      return { score: candidate.base + cohesion - travel * TRAVEL_DECAY }
+    }
+
+    function evaluateBrain() {
+      const brain = navBrainRef.current
+      brain.evaluatedAt = now
+      brain.keywords = queryKeywords()
+      brain.headings.clear()
+
+      const viewTop = window.scrollY - 240
+      const viewBottom = window.scrollY + H + 320
+      const candidates = []
+      for (let id = Math.max(0, readIndex); id < cache.words.length; id += 1) {
+        const box = cache.boxes.get(id)
+        if (!box) continue
+        if (box.y + box.h < viewTop || box.y > viewBottom) continue
+        const word = cache.words[id]
+        if (!word) continue
+        candidates.push({
+          id,
+          box,
+          centre: V(box.x + box.w / 2, box.y + box.h / 2),
+          word,
+          base: semanticValue(word, id),
+        })
+      }
+
+      brain.scores.clear()
+      if (!candidates.length) {
+        brain.target = null
+        brain.targetId = null
+        brain.clusterWordIds = []
+        return
+      }
+
+      const highValue = candidates.filter((candidate) => candidate.base >= HIGH_VALUE)
+      let best = null
+      for (const candidate of candidates) {
+        const result = scoreWordCandidate(candidate, highValue)
+        brain.scores.set(candidate.id, result.score)
+        if (!best || result.score > best.score) best = { ...candidate, score: result.score }
+      }
+      if (!best) return
+
+      const pool = highValue.length ? highValue : candidates
+      let sumX = 0
+      let sumY = 0
+      let count = 0
+      const clusterWordIds = []
+      for (const candidate of pool) {
+        if (distance(candidate.centre, best.centre) > CLUSTER_RADIUS) continue
+        clusterWordIds.push(candidate.id)
+        sumX += candidate.centre.x
+        sumY += candidate.centre.y
+        count += 1
+      }
+      if (!count) {
+        sumX = best.centre.x
+        sumY = best.centre.y
+        count = 1
+        clusterWordIds.push(best.id)
+      }
+
+      const box = safeBox()
+      brain.target = V(clamp(sumX / count, box.l, box.r), clamp(sumY / count, box.t, box.b))
+      brain.targetId = best.id
+      brain.clusterId = `cluster:${best.id}`
+      brain.clusterWordIds = clusterWordIds
+      brain.evaluatedAt = now
+    }
+
+    function gripClusterId(wordId) {
+      const brain = navBrainRef.current
+      return brain.clusterWordIds.includes(wordId) ? brain.clusterId : `cluster:${wordId}`
+    }
+
+    function refreshTopConcepts() {
+      const brain = navBrainRef.current
+      const ranked = [...brain.gripLog].sort((a, b) => b.score - a.score)
+      const seen = new Set()
+      const top = []
+      for (const entry of ranked) {
+        if (entry.score < HIGH_VALUE) continue
+        const key = entry.word.toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        top.push(entry.word)
+        if (top.length >= 10) break
+      }
+      brain.topConcepts = top
+    }
+
+    /** Structured grip memory; existing telemetry fields are untouched. */
+    function recordGripDetail(word) {
+      const brain = navBrainRef.current
+      // Grips can land on words outside the last evaluation window, so fall
+      // back to that word's intrinsic value minus its travel cost.
+      const evaluated = brain.scores.get(word.id)
+      const box = cache.boxes.get(word.id)
+      const centre = box ? V(box.x + box.w / 2, box.y + box.h / 2) : S.p
+      const score = evaluated ?? semanticValue(word, word.id) - distance(centre, S.p) * TRAVEL_DECAY
+      brain.gripLog.push({
+        word: word.text,
+        score: Math.round(score * 100) / 100,
+        sectionHeading: headingForWord(word.id),
+        clusterId: gripClusterId(word.id),
+        timestamp: Date.now(),
+      })
+      if (brain.gripLog.length > 120) brain.gripLog.splice(0, brain.gripLog.length - 120)
+      refreshTopConcepts()
+    }
+
     function highlightSentence(sentence) {
       for (let index = sentence.keyStart; index <= sentence.keyEnd; index += 1) {
         markClass(cache.words[index], 'key')
@@ -1217,7 +1440,11 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
             telemetry.gripCount += 1
             const sectionIndex = sectionIndexAt(word.id)
             telemetry.sectionGrips.set(sectionIndex, (telemetry.sectionGrips.get(sectionIndex) || 0) + 1)
+            recordGripDetail(word)
           }
+          // A gripped target is consumed: re-lock immediately instead of
+          // waiting for the next 450ms tick.
+          if (navBrainRef.current.targetId === word.id) navBrainRef.current.evaluatedAt = -1
         }
         if (word.filler) mutateFiller(word)
         else if (R() < 0.12) leg.tint = '#D4D4D4'
@@ -1272,6 +1499,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
     function buildMemorySnapshot() {
       const meta = metaRef.current
       if (!meta.sessionId) return null
+      refreshTopConcepts()
       const sections = cache.sectionInfo.slice(-MAX_SECTIONS).map((item) => {
         const entities = [...(telemetry.sectionEntities.get(item.index) || new Map()).entries()]
           .sort((a, b) => b[1] - a[1])
@@ -1306,6 +1534,10 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         gripCount: telemetry.gripCount,
         sections,
         traversalEdges,
+        // Structured grip memory and the derived concept list ride alongside
+        // the existing fields; nothing here replaces or renames them.
+        grips: navBrainRef.current.gripLog.slice(-60),
+        topConcepts: [...navBrainRef.current.topConcepts],
       }
     }
 
@@ -1335,14 +1567,24 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       if (auto) {
         S.brake = false
         advanceRead()
-        const words = cache.words
-        if (words.length) {
-          const index = Math.min(readIndex + 3, words.length - 1)
-          const box = cache.boxes.get(words[index].id)
-          if (box) S.target = V(box.x + box.w / 2, box.y + box.h / 2)
-          else if (now > S.tUntil) pickWander()
-        } else if (now > S.tUntil) {
-          pickWander()
+        const brain = navBrainRef.current
+        const consumed =
+          brain.targetId == null ||
+          brain.targetId < readIndex ||
+          !cache.boxes.has(brain.targetId)
+        if (!brain.target || consumed || now - brain.evaluatedAt >= NAV_EVAL_INTERVAL) evaluateBrain()
+        if (brain.target) {
+          S.target = V(brain.target.x, brain.target.y)
+        } else {
+          const words = cache.words
+          if (words.length) {
+            const index = Math.min(readIndex + 3, words.length - 1)
+            const box = cache.boxes.get(words[index].id)
+            if (box) S.target = V(box.x + box.w / 2, box.y + box.h / 2)
+            else if (now > S.tUntil) pickWander()
+          } else if (now > S.tUntil) {
+            pickWander()
+          }
         }
       } else {
         if (mouse.has) {
@@ -1364,7 +1606,19 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       const d = length(to)
       const maxSpeed = auto ? T.cruise * burst : T.cursor
       const brake = !auto || S.brake
-      const want = d > 2 ? mul(to, (brake ? Math.min(maxSpeed, d * 2.2) : maxSpeed) / d) : V()
+      let want = V()
+      if (d > 2) {
+        if (brake) {
+          want = mul(to, Math.min(maxSpeed, d * 2.2) / d)
+        } else {
+          // Reynolds seek + arrive blend: cruise at the lock from a distance,
+          // then ease onto the cluster centre as the spider closes in.
+          const slowRadius = Math.max(T.arrive * 3, 180)
+          const arriveSpeed = maxSpeed * clamp(d / slowRadius, 0.12, 1)
+          const seekWeight = clamp((d - slowRadius / 2) / (slowRadius / 2), 0, 1)
+          want = mul(to, mix(arriveSpeed, maxSpeed, seekWeight) / d)
+        }
+      }
       S.v = lerp(S.v, want, damp(auto ? 6.5 : 10, dt))
       S.p = add(S.p, mul(S.v, dt))
 
