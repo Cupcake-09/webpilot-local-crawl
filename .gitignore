@@ -1,5 +1,14 @@
 ﻿node_modules/
-.venv/
+frontend/node_modules/
+frontend/dist/
 __pycache__/
-dist/
+*.pyc
+venv/
+.venv/
 .env
+backend/.env
+backend/audio_cache/
+*.gguf
+*.bin
+*.safetensors
+.DS_Store
