@@ -1,6 +1,12 @@
 import { useMemo, useState } from 'react'
 
-const UNIT_COLORS = ['#34D399', '#22D3EE', '#A78BFA', '#FBBF24', '#FB7185']
+import {
+  buildFallbackMetrics,
+  extractTextMetrics,
+  rowsFromNumericPoints,
+  signalRating,
+} from '../utils/researchMetrics.js'
+
 const NODE_HEIGHT = 44
 
 const fmtNumber = (value) => {
@@ -38,11 +44,14 @@ function Kpi({ label, value, hint, accent }) {
   )
 }
 
-function KpiStrip({ payload }) {
+function KpiStrip({ payload, fullTextCount = 0 }) {
   const stats = payload?.stats ?? {}
   const numeric = payload?.numericSeries ?? []
   const highest = stats.highestSection
   const snr = stats.concepts ? `${stats.signalToNoise ?? 0}%` : '—'
+  // The essay-wide scan counts every number in the text, not only the tokens
+  // the spider happened to grip, so this tile never under-reports the charts.
+  const numericCount = Math.max(numeric.length, fullTextCount)
 
   return (
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
@@ -59,8 +68,14 @@ function KpiStrip({ payload }) {
       />
       <Kpi
         label="Numeric Data Points"
-        value={fmtNumber(numeric.length)}
-        hint={numeric.length ? `paired across ${stats.sections ?? 0} sections` : 'no numbers paired with sections'}
+        value={fmtNumber(numericCount)}
+        hint={
+          numericCount
+            ? fullTextCount > numeric.length
+              ? `scanned from the full essay text`
+              : `paired across ${stats.sections ?? 0} sections`
+            : 'no numbers found in the essay text'
+        }
       />
       <Kpi
         label="Highest-Salience Section"
@@ -119,243 +134,702 @@ function Takeaways({ payload }) {
   )
 }
 
-function MetricComparisonChart({ points }) {
-  const [active, setActive] = useState(null)
+/* ------------------------------------------------------------------ */
+/* Analytics charts                                                    */
+/* ------------------------------------------------------------------ */
 
-  const groups = []
-  const byEntity = new Map()
-  for (const point of points) {
-    const key = point.entity || point.sectionHeading || 'Unassigned'
-    if (!byEntity.has(key)) {
-      const group = { entity: key, points: [] }
-      byEntity.set(key, group)
-      groups.push(group)
+const FAMILY_COLORS = {
+  percent: '#34D399',
+  time: '#22D3EE',
+  currency: '#FBBF24',
+  ratio: '#A78BFA',
+  energy: '#FB7185',
+  count: '#94A3B8',
+  year: '#64748B',
+  size: '#38BDF8',
+  mass: '#FDBA74',
+  frequency: '#5EEAD4',
+  throughput: '#93C5FD',
+  power: '#FCA5A5',
+}
+const familyColor = (family) => FAMILY_COLORS[family] || '#9B9B9B'
+
+const unitLabel = (unit) => {
+  if (!unit) return 'value'
+  if (unit === 'count') return 'count'
+  return unit
+}
+
+/** Wrap a heading into fixed-width lines; never let it overflow the plot. */
+function wrapLabel(value, maxChars, maxLines = 5) {
+  const words = String(value ?? '')
+    .split(/\s+/)
+    .filter(Boolean)
+  const lines = []
+  let line = ''
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word
+    if (candidate.length <= maxChars || !line) {
+      line = candidate.slice(0, maxChars)
+      continue
     }
-    byEntity.get(key).points.push(point)
+    lines.push(line)
+    line = word.slice(0, maxChars)
+    if (lines.length >= maxLines) break
   }
-  const visibleGroups = groups.slice(0, 6).map((group) => ({ ...group, points: group.points.slice(0, 3) }))
-  const unitIndex = [...new Set(visibleGroups.flatMap((group) => group.points.map((point) => point.unit || 'value')))]
-
-  const width = 760
-  const left = 176
-  const right = 96
-  const top = 20
-  const rowHeight = 26
-  const groupGap = 14
-  const plotWidth = width - left - right
-
-  let cursor = top
-  const rows = []
-  const groupLabels = []
-  for (const group of visibleGroups) {
-    const start = cursor
-    for (const point of group.points) {
-      rows.push({ ...point, group: group.entity, y: cursor + rowHeight / 2 })
-      cursor += rowHeight
-    }
-    groupLabels.push({ entity: group.entity, y: (start + cursor - rowHeight / 2) / 2 })
-    cursor += groupGap
+  if (lines.length < maxLines && line) lines.push(line)
+  const shown = lines.join(' ').length
+  const total = words.join(' ').length
+  if (shown < total && lines.length) {
+    lines[lines.length - 1] = `${lines[lines.length - 1].slice(0, Math.max(1, maxChars - 1))}…`
   }
-  const height = Math.max(230, cursor + 16)
-  const unitMax = new Map()
-  for (const row of rows) unitMax.set(row.unit || 'value', Math.max(unitMax.get(row.unit || 'value') ?? 0, row.value))
-  const colorOf = (unit) => UNIT_COLORS[Math.max(0, unitIndex.indexOf(unit || 'value')) % UNIT_COLORS.length]
-  const current = active != null ? rows[active] : null
+  return lines.length ? lines : ['']
+}
 
-  if (!points.length) {
-    return <Empty text="No numeric metrics yet. Let Auto-Iterate walk a section that contains numbers to build this series." />
-  }
-
+/** Dark glass tooltip that floats above the cursor without clipping. */
+function GlassTooltip({ x, y, children }) {
+  if (x == null || y == null) return null
   return (
-    <div>
-      <div className="mb-2 h-5 truncate text-[11.5px] text-[#8A8A8A]">
-        {current ? (
-          <span className="text-[#ECECEC]">
-            {current.raw} <span className="text-[#8A8A8A]">· {current.group} · source: {current.sectionHeading}</span>
-          </span>
-        ) : (
-          'Hover a bar to see its entity and source section'
-        )}
-      </div>
-      <div className="overflow-x-auto">
-        <svg
-          viewBox={`0 0 ${width} ${height}`}
-          className="h-auto w-full min-w-[620px]"
-          role="img"
-          aria-label="Extracted numeric metrics by entity"
-        >
-          {[0, 0.25, 0.5, 0.75, 1].map((fraction) => (
-            <line
-              key={fraction}
-              x1={left + plotWidth * fraction}
-              x2={left + plotWidth * fraction}
-              y1={top - 4}
-              y2={height - 10}
-              stroke="#2F2F2F"
-              strokeDasharray={fraction === 0 ? undefined : '2 4'}
-              strokeWidth="1"
-            />
-          ))}
-          {groupLabels.map((group) => (
-            <text key={`group-${group.entity}`} x={8} y={group.y + 3.5} fontSize="10" fill="#BDBDBD">
-              {truncate(group.entity, 13)}
-            </text>
-          ))}
-          {rows.map((row, index) => {
-            const unit = row.unit || 'value'
-            const max = Math.max(1, unitMax.get(unit) ?? 1)
-            const barWidth = Math.max(2, (row.value / max) * plotWidth)
-            const isActive = active === index
-            return (
-              <g
-                key={`${row.raw}-${row.sectionHeading}-${index}`}
-                onMouseEnter={() => setActive(index)}
-                onMouseLeave={() => setActive(null)}
-              >
-                <rect x={left} y={row.y - rowHeight / 2} width={plotWidth} height={rowHeight} fill="transparent" />
-                <rect
-                  x={left}
-                  y={row.y - 7}
-                  width={barWidth}
-                  height="14"
-                  rx="4"
-                  fill={colorOf(unit)}
-                  opacity={isActive ? 1 : 0.82}
-                  className="transition-opacity duration-150"
-                />
-                <text x={left + barWidth + 7} y={row.y + 3} fontSize="9.5" fill={isActive ? '#ECECEC' : '#8A8A8A'}>
-                  {fmtNumber(row.value)}
-                  {unit !== 'value' ? ` ${unit}` : ''}
-                </text>
-                <text x={left - 12} y={row.y + 3.5} textAnchor="end" fontSize="9.5" fill={isActive ? '#ECECEC' : '#6F6F6F'}>
-                  {truncate(row.raw, 14)}
-                </text>
-              </g>
-            )
-          })}
-        </svg>
-      </div>
-      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1.5">
-        {unitIndex.map((unit) => (
-          <span key={unit} className="inline-flex items-center gap-1.5 text-[10.5px] text-[#8A8A8A]">
-            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: colorOf(unit) }} />
-            {unit === 'value' ? 'unitless' : unit}
-          </span>
-        ))}
-      </div>
+    <div
+      role="tooltip"
+      className="pointer-events-none fixed z-50 w-[244px] rounded-2xl border border-white/10 bg-[#0B0B0B]/85 p-3 shadow-[0_22px_50px_rgba(0,0,0,0.65)] backdrop-blur-xl"
+      style={{ left: x, top: y, transform: 'translate(-50%, calc(-100% - 14px))' }}
+    >
+      {children}
     </div>
   )
 }
 
-function SalienceVolumeChart({ sections }) {
-  const [active, setActive] = useState(null)
+const clampTooltipX = (clientX) => {
+  if (typeof window === 'undefined') return clientX
+  return Math.min(Math.max(clientX, 132), window.innerWidth - 132)
+}
 
-  if (!sections.length) {
-    return <Empty text="No section shares to compare yet. Run Auto-Iterate over the essay first." />
+function MetricComparisonChart({ data }) {
+  const [hover, setHover] = useState(null)
+  const rows = data?.rows ?? []
+
+  // Group by section (document order) so every bar keeps its provenance, and
+  // scale each bar against the largest value of its own unit across the whole
+  // essay — that keeps counts, latencies and percentages honest on one plot.
+  const model = useMemo(() => {
+    const unitMax = new Map()
+    for (const row of rows) {
+      const unit = row.unit || 'count'
+      unitMax.set(unit, Math.max(unitMax.get(unit) || 0, row.value))
+    }
+    const bySection = new Map()
+    for (const row of rows) {
+      const key = row.sectionHeading || 'General Context'
+      if (!bySection.has(key)) bySection.set(key, [])
+      bySection.get(key).push(row)
+    }
+    const blocks = [...bySection.entries()].slice(0, 6).map(([heading, list]) => ({
+      heading,
+      points: [...list].sort((a, b) => b.value - a.value).slice(0, 4),
+    }))
+    return { blocks, unitMax }
+  }, [rows])
+
+  const width = 800
+  const gutter = 252
+  const right = 108
+  const rowHeight = 26
+  const blockHeader = 26
+  const blockGap = 12
+  const plotWidth = width - gutter - right
+
+  const { blocks, height, unitMax } = useMemo(() => {
+    let cursor = 20
+    const laid = model.blocks.map((block) => {
+      const start = cursor
+      cursor += blockHeader
+      const points = block.points.map((point) => {
+        const y = cursor + rowHeight / 2
+        cursor += rowHeight
+        return { ...point, y }
+      })
+      cursor += blockGap
+      return { ...block, points, start, end: cursor - blockGap }
+    })
+    return { blocks: laid, height: Math.max(190, cursor + 10), unitMax: model.unitMax }
+  }, [model])
+
+  const units = useMemo(() => {
+    const seen = new Map()
+    for (const row of rows) {
+      const unit = row.unit || 'count'
+      if (!seen.has(unit)) seen.set(unit, row.family || 'count')
+    }
+    return [...seen.entries()]
+  }, [rows])
+
+  if (!rows.length) {
+    return (
+      <Empty text="No quantitative signal in this run yet — the full-text scan runs as soon as an essay finishes, and derived section metrics fill in when the text has no numbers." />
+    )
   }
 
-  const width = 760
-  const height = 300
-  const pad = { top: 24, right: 18, bottom: 54, left: 38 }
-  const plotWidth = width - pad.left - pad.right
-  const plotHeight = height - pad.top - pad.bottom
-  const groupWidth = plotWidth / sections.length
-  const barWidth = Math.min(26, groupWidth * 0.3)
-  const current = active != null ? sections[active] : null
+  const hovered = hover?.point ?? null
 
   return (
     <div>
-      <div className="mb-2 h-5 truncate text-[11.5px] text-[#8A8A8A]">
-        {current ? (
-          <span className="text-[#ECECEC]">
-            {current.heading}{' '}
-            <span className="text-[#8A8A8A]">
-              · word share {fmtNumber(current.wordShare)}% · avg salience {fmtNumber(current.avgScore)}/10
-            </span>
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <p className="text-[11.5px] leading-5 text-[#8A8A8A]">
+          {data.fallback
+            ? 'No explicit numbers in this essay — comparing derived section metrics.'
+            : `${data.total} values scanned from ${data.sections} ${data.sections === 1 ? 'section' : 'sections'}.`}
+        </p>
+        <span className="rounded-full border border-[#2F2F2F] bg-[#171717] px-2 py-0.5 font-mono text-[9.5px] uppercase tracking-wide text-[#9B9B9B]">
+          {data.fallback ? 'fallback KPIs' : 'full-text scan'}
+        </span>
+      </div>
+      <div className="relative overflow-x-auto">
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          className="h-auto w-full min-w-[640px]"
+          role="img"
+          aria-label="Extracted research metrics grouped by section"
+        >
+          <defs>
+            {[...new Set(blocks.map((block) => block.points.map((point) => point.family)).flat())].map((family) => (
+              <linearGradient key={`grad-${family}`} id={`metric-${family}`} x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%" stopColor={familyColor(family)} stopOpacity="0.38" />
+                <stop offset="100%" stopColor={familyColor(family)} stopOpacity="1" />
+              </linearGradient>
+            ))}
+          </defs>
+          {blocks.map((block) => (
+            <g key={`block-${block.heading}`}>
+              <circle cx={11} cy={block.start + 11} r="2.5" fill="#38BDF8" opacity="0.8" />
+              <text x={20} y={block.start + 15} fontSize="10.5" fill="#D4D4D4">
+                {truncate(block.heading, 56)}
+              </text>
+              <text x={width - 8} y={block.start + 15} textAnchor="end" fontSize="9" fill="#6F6F6F">
+                {block.points.length} {block.points.length === 1 ? 'value' : 'values'}
+              </text>
+              <line x1={8} x2={width - 8} y1={block.start + 21} y2={block.start + 21} stroke="#2A2A2A" strokeWidth="1" />
+              {block.points.map((point) => {
+                const unit = point.unit || 'count'
+                const max = Math.max(unitMax.get(unit) || point.value, 1)
+                const barWidth = Math.max(2, (point.value / (max * 1.2)) * plotWidth)
+                const isActive =
+                  hover?.point?.label === point.label && hover?.point?.sectionHeading === point.sectionHeading
+                const valueText = `${fmtNumber(point.value)}${point.unit && point.unit !== 'count' ? ` ${point.unit}` : ''}`
+                const collide = gutter + barWidth + 8 > width - 96
+                return (
+                  <g
+                    key={`${point.label}-${point.sectionHeading}-${point.y}`}
+                    onMouseMove={(event) =>
+                      setHover({ point, x: clampTooltipX(event.clientX), y: event.clientY })
+                    }
+                    onMouseLeave={() => setHover(null)}
+                  >
+                    <rect
+                      x={4}
+                      y={point.y - rowHeight / 2 + 1}
+                      width={width - 8}
+                      height={rowHeight - 2}
+                      rx="6"
+                      fill={isActive ? '#232323' : 'transparent'}
+                    />
+                    <rect x={gutter} y={point.y - 4} width={plotWidth} height="9" rx="4" fill="#212121" />
+                    <rect
+                      x={gutter}
+                      y={point.y - 4}
+                      width={barWidth}
+                      height="9"
+                      rx="4"
+                      fill={`url(#metric-${point.family})`}
+                      opacity={isActive ? 1 : 0.92}
+                    />
+                    <rect
+                      x={Math.max(gutter, gutter + barWidth - 3)}
+                      y={point.y - 4}
+                      width={3}
+                      height="9"
+                      rx="1.5"
+                      fill="#FFFFFF"
+                      opacity={isActive ? 0.55 : 0.26}
+                    />
+                    <text
+                      x={gutter - 12}
+                      y={point.y + 3.5}
+                      textAnchor="end"
+                      fontSize="10.5"
+                      fill={isActive ? '#ECECEC' : '#C9C9C9'}
+                    >
+                      {truncate(point.label, 30)}
+                    </text>
+                    <text
+                      x={collide ? width - 6 : gutter + barWidth + 8}
+                      y={point.y + 3.5}
+                      textAnchor={collide ? 'end' : 'start'}
+                      fontSize="9.5"
+                      fill={isActive ? '#ECECEC' : '#8A8A8A'}
+                    >
+                      {valueText}
+                    </text>
+                  </g>
+                )
+              })}
+            </g>
+          ))}
+        </svg>
+      </div>
+      <p className="mt-2 text-[10.5px] leading-4 text-[#6F6F6F]">
+        Bars are grouped by the section they were found in, and each is scaled to the largest value of its own unit, so
+        counts, latencies and percentages never distort each other. Hover a bar for the sentence it came from.
+      </p>
+      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1.5">
+        {units.map(([unit, family]) => (
+          <span key={`legend-${unit}`} className="inline-flex items-center gap-1.5 text-[10.5px] text-[#8A8A8A]">
+            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: familyColor(family) }} />
+            {unitLabel(unit)}
           </span>
-        ) : (
-          'Hover a section to compare technical density against filler volume'
-        )}
+        ))}
+      </div>
+      <GlassTooltip x={hover?.x} y={hover?.y}>
+        {hovered ? (
+          <div>
+            <p className="text-[9.5px] uppercase leading-4 tracking-[0.08em] text-[#7A7A7A]">
+              {hovered.sectionHeading}
+            </p>
+            <p className="mt-1 font-mono text-[13px] text-[#ECECEC]">{hovered.label}</p>
+            <p className="mt-1 text-[11px] text-[#BDBDBD]">
+              {fmtNumber(hovered.value)}
+              {hovered.unit && hovered.unit !== 'count' ? ` ${hovered.unit}` : ''}
+            </p>
+            {hovered.context ? (
+              <p className="mt-1.5 line-clamp-3 text-[10.5px] leading-4 text-[#8A8A8A]">“{hovered.context}”</p>
+            ) : null}
+          </div>
+        ) : null}
+      </GlassTooltip>
+    </div>
+  )
+}
+
+function SignalRatingPill({ rating }) {
+  const tone =
+    rating === 'High Signal'
+      ? 'border-[#34D399]/40 bg-[#34D399]/10 text-[#6EE7B7]'
+      : rating === 'Balanced'
+        ? 'border-[#22D3EE]/40 bg-[#22D3EE]/10 text-[#67E8F9]'
+        : 'border-[#FBBF24]/40 bg-[#FBBF24]/10 text-[#FCD34D]'
+  return (
+    <span className={`rounded-full border px-2 py-0.5 text-[10px] font-medium ${tone}`}>{rating}</span>
+  )
+}
+
+function SalienceVolumeChart({ sections }) {
+  const [layout, setLayout] = useState('columns')
+  const [hover, setHover] = useState(null)
+
+  const ordered = useMemo(() => {
+    const list = (Array.isArray(sections) ? sections : []).filter((section) => section && section.heading)
+    if (layout !== 'ranked') return list
+    return [...list].sort(
+      (a, b) => (Number(b.avgScore) || 0) - (Number(a.avgScore) || 0) || (Number(b.wordShare) || 0) - (Number(a.wordShare) || 0),
+    )
+  }, [sections, layout])
+
+  if (!ordered.length) {
+    return <Empty text="No section shares to compare yet. Run Auto-Iterate over the essay first." />
+  }
+
+  const volumeOf = (section) => Math.max(0, Math.min(100, Number(section.wordShare) || 0))
+  const salienceOf = (section) => Math.max(0, Math.min(10, Number(section.avgScore) || 0))
+  const saliencePct = (section) => salienceOf(section) * 10
+  const maxValue = Math.max(...ordered.map((section) => Math.max(volumeOf(section), saliencePct(section))), 1)
+  const ceiling = Math.max(1, Math.ceil(maxValue * 1.2))
+  const average = ordered.reduce((sum, section) => sum + volumeOf(section), 0) / ordered.length
+  const current = hover ? ordered[hover.index] : null
+
+  const toggle = (
+    <div role="group" aria-label="Chart layout" className="inline-flex rounded-full border border-[#2F2F2F] bg-[#171717] p-1">
+      {[
+        { id: 'columns', label: 'Grouped Columns' },
+        { id: 'ranked', label: 'Ranked Bars' },
+      ].map((option) => (
+        <button
+          key={option.id}
+          type="button"
+          aria-pressed={layout === option.id}
+          onClick={() => {
+            setLayout(option.id)
+            setHover(null)
+          }}
+          className={`rounded-full px-2.5 py-1 text-[10.5px] transition-colors ${
+            layout === option.id ? 'bg-[#ECECEC] font-medium text-[#0D0D0D]' : 'text-[#9B9B9B] hover:text-[#ECECEC]'
+          }`}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  )
+
+  const show = (event, index) =>
+    setHover({ index, x: clampTooltipX(event.clientX), y: event.clientY })
+
+  const legend = (
+    <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[10.5px] text-[#8A8A8A]">
+      <span className="inline-flex items-center gap-1.5">
+        <span className="h-2 w-2 rounded-full bg-[#34D399]" /> word share (% of section words)
+      </span>
+      <span className="inline-flex items-center gap-1.5">
+        <span className="h-2 w-2 rounded-full bg-[#22D3EE]" /> avg salience (pts, plotted ×10)
+      </span>
+      <span className="inline-flex items-center gap-1.5">
+        <span className="h-[2px] w-4 border-t border-dashed border-[#64748B]" /> section average
+      </span>
+    </div>
+  )
+
+  const tooltip = (
+    <GlassTooltip x={hover?.x} y={hover?.y}>
+      {current ? (
+        <div>
+          <p className="text-[11.5px] font-medium leading-4 text-[#ECECEC]">{current.heading}</p>
+          <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-[10.5px]">
+            <dt className="text-[#7A7A7A]">Word share</dt>
+            <dd className="text-right font-mono text-[#6EE7B7]">{fmtNumber(volumeOf(current))}%</dd>
+            <dt className="text-[#7A7A7A]">Avg salience</dt>
+            <dd className="text-right font-mono text-[#67E8F9]">{fmtNumber(salienceOf(current))}/10</dd>
+            <dt className="text-[#7A7A7A]">Grips</dt>
+            <dd className="text-right font-mono text-[#ECECEC]">{fmtNumber(current.gripCount || 0)}</dd>
+          </dl>
+          <div className="mt-2 flex items-center justify-between gap-2">
+            <span className="text-[9.5px] uppercase tracking-[0.08em] text-[#7A7A7A]">Signal rating</span>
+            <SignalRatingPill rating={signalRating(current)} />
+          </div>
+        </div>
+      ) : null}
+    </GlassTooltip>
+  )
+
+  if (layout === 'ranked') {
+    const width = 820
+    const pad = { top: 30, right: 108, left: 272 }
+    const rowHeight = 48
+    const plotWidth = width - pad.left - pad.right
+    const height = pad.top + ordered.length * rowHeight + 10
+    const avgX = pad.left + (average / ceiling) * plotWidth
+
+    return (
+      <div>
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <p className="text-[11.5px] text-[#8A8A8A]">Ranked by salience — full section titles read left to right.</p>
+          {toggle}
+        </div>
+        <div className="overflow-x-auto">
+          <svg
+            viewBox={`0 0 ${width} ${height}`}
+            className="h-auto w-full min-w-[640px]"
+            role="img"
+            aria-label="Ranked word share and salience by section"
+          >
+            <defs>
+              <linearGradient id="sv-ranked-volume" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%" stopColor="#34D399" stopOpacity="0.35" />
+                <stop offset="100%" stopColor="#34D399" stopOpacity="1" />
+              </linearGradient>
+              <linearGradient id="sv-ranked-salience" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%" stopColor="#22D3EE" stopOpacity="0.35" />
+                <stop offset="100%" stopColor="#22D3EE" stopOpacity="1" />
+              </linearGradient>
+            </defs>
+            <line
+              x1={avgX}
+              x2={avgX}
+              y1={pad.top - 12}
+              y2={height - 8}
+              stroke="#64748B"
+              strokeDasharray="5 5"
+              strokeWidth="1"
+            />
+            <text x={avgX + 6} y={pad.top - 16} fontSize="9" fill="#9B9B9B">
+              avg {fmtNumber(average)}%
+            </text>
+            {ordered.map((section, index) => {
+              const rowY = pad.top + index * rowHeight
+              const volume = volumeOf(section)
+              const salience = saliencePct(section)
+              const volumeWidth = Math.max(2, (volume / ceiling) * plotWidth)
+              const salienceWidth = Math.max(2, (salience / ceiling) * plotWidth)
+              const isActive = hover?.index === index
+              return (
+                <g key={`${section.heading}-${index}`} onMouseMove={(event) => show(event, index)} onMouseLeave={() => setHover(null)}>
+                  <rect
+                    x={4}
+                    y={rowY + 1}
+                    width={width - 8}
+                    height={rowHeight - 2}
+                    rx="7"
+                    fill={isActive ? '#232323' : 'transparent'}
+                  />
+                  {wrapLabel(section.heading, 34, 2).map((line, lineIndex) => (
+                    <text
+                      key={`${index}-title-${lineIndex}`}
+                      x={12}
+                      y={rowY + 18 + lineIndex * 12}
+                      fontSize="10.5"
+                      fill={isActive ? '#ECECEC' : '#C9C9C9'}
+                    >
+                      {line}
+                    </text>
+                  ))}
+                  <text x={12} y={rowY + 42} fontSize="9" fill="#6F6F6F">
+                    {fmtNumber(section.gripCount || 0)} grips · {fmtNumber(section.words || 0)} words
+                  </text>
+                  <rect x={pad.left} y={rowY + 9} width={plotWidth} height="9" rx="4" fill="#212121" />
+                  <rect x={pad.left} y={rowY + 9} width={volumeWidth} height="9" rx="4" fill="url(#sv-ranked-volume)" />
+                  <rect
+                    x={Math.max(pad.left, pad.left + volumeWidth - 3)}
+                    y={rowY + 9}
+                    width={3}
+                    height="9"
+                    rx="1.5"
+                    fill="#A7F3D0"
+                    opacity="0.75"
+                  />
+                  <text x={pad.left + volumeWidth + 7} y={rowY + 17} fontSize="9" fill="#8A8A8A">
+                    {fmtNumber(volume)}%
+                  </text>
+                  <rect x={pad.left} y={rowY + 23} width={plotWidth} height="9" rx="4" fill="#212121" />
+                  <rect
+                    x={pad.left}
+                    y={rowY + 23}
+                    width={salienceWidth}
+                    height="9"
+                    rx="4"
+                    fill="url(#sv-ranked-salience)"
+                  />
+                  <rect
+                    x={Math.max(pad.left, pad.left + salienceWidth - 3)}
+                    y={rowY + 23}
+                    width={3}
+                    height="9"
+                    rx="1.5"
+                    fill="#A5F3FC"
+                    opacity="0.75"
+                  />
+                  <text x={pad.left + salienceWidth + 7} y={rowY + 31} fontSize="9" fill="#8A8A8A">
+                    {fmtNumber(salienceOf(section))} pts
+                  </text>
+                  <SignalRatingPillProxy x={width - 100} y={rowY + 22} rating={signalRating(section)} />
+                </g>
+              )
+            })}
+          </svg>
+        </div>
+        {legend}
+        {tooltip}
+      </div>
+    )
+  }
+
+  const width = 820
+  const pad = { top: 28, right: 20, left: 44 }
+  const plotHeight = 232
+  const plotWidth = width - pad.left - pad.right
+  const groupWidth = plotWidth / ordered.length
+  const barWidth = Math.max(8, Math.min(20, groupWidth * 0.27))
+  const labelChars = Math.min(24, Math.max(8, Math.floor(groupWidth / 5.4)))
+  const labelLines = ordered.map((section) => wrapLabel(section.heading, labelChars, 5))
+  const maxLines = labelLines.reduce((longest, lines) => Math.max(longest, lines.length), 1)
+  const bottom = 18 + maxLines * 10.5
+  const height = pad.top + plotHeight + bottom
+  const base = pad.top + plotHeight
+  const avgY = base - (average / ceiling) * plotHeight
+  const ticks = [0, 0.25, 0.5, 0.75, 1]
+
+  return (
+    <div>
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <p className="text-[11.5px] leading-5 text-[#8A8A8A]">
+          Paired columns, auto-scaled to {ceiling}% so the tallest bar fills the plot — green labels are word share (%),
+          cyan labels are avg salience (pts).
+        </p>
+        {toggle}
       </div>
       <div className="overflow-x-auto">
         <svg
           viewBox={`0 0 ${width} ${height}`}
-          className="h-auto w-full min-w-[620px]"
+          className="h-auto w-full min-w-[640px]"
           role="img"
           aria-label="Word share versus semantic salience by section"
         >
-          {[0, 0.25, 0.5, 0.75, 1].map((fraction) => (
-            <g key={fraction}>
-              <line
-                x1={pad.left}
-                x2={width - pad.right}
-                y1={pad.top + plotHeight * (1 - fraction)}
-                y2={pad.top + plotHeight * (1 - fraction)}
-                stroke="#2F2F2F"
-                strokeDasharray={fraction === 0 ? undefined : '2 4'}
-                strokeWidth="1"
-              />
-              <text x={pad.left - 8} y={pad.top + plotHeight * (1 - fraction) + 3} textAnchor="end" fontSize="9" fill="#6F6F6F">
-                {Math.round(fraction * 100)}%
-              </text>
-            </g>
-          ))}
-          {sections.map((section, index) => {
-            const groupX = pad.left + index * groupWidth
-            const volume = Math.max(0, Math.min(100, section.wordShare))
-            const salience = Math.max(0, Math.min(100, section.avgScore * 10))
-            const volumeHeight = (volume / 100) * plotHeight
-            const salienceHeight = (salience / 100) * plotHeight
-            const isActive = active === index
-            const centre = groupX + groupWidth / 2
+          <defs>
+            <linearGradient id="sv-volume" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#6EE7B7" stopOpacity="1" />
+              <stop offset="100%" stopColor="#34D399" stopOpacity="0.32" />
+            </linearGradient>
+            <linearGradient id="sv-salience" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#67E8F9" stopOpacity="1" />
+              <stop offset="100%" stopColor="#22D3EE" stopOpacity="0.32" />
+            </linearGradient>
+          </defs>
+          {ticks.map((fraction) => {
+            const value = ceiling * fraction
+            const y = base - plotHeight * fraction
             return (
-              <g
-                key={`${section.heading}-${index}`}
-                onMouseEnter={() => setActive(index)}
-                onMouseLeave={() => setActive(null)}
-              >
-                <rect x={groupX} y={pad.top} width={groupWidth} height={plotHeight} fill="transparent" />
-                <rect
-                  x={centre - barWidth - 2}
-                  y={pad.top + plotHeight - volumeHeight}
-                  width={barWidth}
-                  height={Math.max(2, volumeHeight)}
-                  rx="3"
-                  fill="#34D399"
-                  opacity={isActive ? 1 : 0.82}
+              <g key={fraction}>
+                <line
+                  x1={pad.left}
+                  x2={width - pad.right}
+                  y1={y}
+                  y2={y}
+                  stroke="#2F2F2F"
+                  strokeDasharray={fraction === 0 ? undefined : '2 4'}
+                  strokeWidth="1"
                 />
-                <rect
-                  x={centre + 2}
-                  y={pad.top + plotHeight - salienceHeight}
-                  width={barWidth}
-                  height={Math.max(2, salienceHeight)}
-                  rx="3"
-                  fill="#22D3EE"
-                  opacity={isActive ? 1 : 0.82}
-                />
-                <text x={centre} y={height - 30} textAnchor="middle" fontSize="9.5" fill={isActive ? '#ECECEC' : '#8A8A8A'}>
-                  {truncate(section.heading, sections.length > 6 ? 9 : 14)}
-                </text>
-                <text x={centre - barWidth / 2 - 2} y={pad.top + plotHeight - volumeHeight - 5} textAnchor="middle" fontSize="8.5" fill="#6F6F6F">
-                  {fmtNumber(volume)}%
-                </text>
-                <text x={centre + barWidth / 2 + 2} y={pad.top + plotHeight - salienceHeight - 5} textAnchor="middle" fontSize="8.5" fill="#6F6F6F">
-                  {fmtNumber(salience / 10)}
+                <text x={pad.left - 8} y={y + 3} textAnchor="end" fontSize="9" fill="#6F6F6F">
+                  {Math.round(value)}
                 </text>
               </g>
             )
           })}
+          <line
+            x1={pad.left}
+            x2={width - pad.right}
+            y1={avgY}
+            y2={avgY}
+            stroke="#64748B"
+            strokeDasharray="5 5"
+            strokeWidth="1"
+          />
+          <text x={width - pad.right} y={avgY - 5} textAnchor="end" fontSize="9" fill="#9B9B9B">
+            section average · {fmtNumber(average)}%
+          </text>
+          {ordered.map((section, index) => {
+            const groupX = pad.left + index * groupWidth
+            const centre = groupX + groupWidth / 2
+            const volume = volumeOf(section)
+            const salience = saliencePct(section)
+            const volumeHeight = (volume / ceiling) * plotHeight
+            const salienceHeight = (salience / ceiling) * plotHeight
+            const isActive = hover?.index === index
+            return (
+              <g key={`${section.heading}-${index}`} onMouseMove={(event) => show(event, index)} onMouseLeave={() => setHover(null)}>
+                <rect x={groupX} y={pad.top - 6} width={groupWidth} height={plotHeight + 6} fill="transparent" />
+                {isActive ? (
+                  <rect
+                    x={groupX + 1}
+                    y={pad.top - 6}
+                    width={groupWidth - 2}
+                    height={plotHeight + 6}
+                    rx="6"
+                    fill="#FFFFFF"
+                    opacity="0.03"
+                  />
+                ) : null}
+                <rect
+                  x={centre - barWidth - 2}
+                  y={base - volumeHeight}
+                  width={barWidth}
+                  height={Math.max(2, volumeHeight)}
+                  rx="3"
+                  fill="url(#sv-volume)"
+                />
+                <rect
+                  x={centre - barWidth - 2}
+                  y={base - volumeHeight}
+                  width={barWidth}
+                  height="2"
+                  rx="1"
+                  fill="#A7F3D0"
+                  opacity="0.85"
+                />
+                <rect
+                  x={centre + 2}
+                  y={base - salienceHeight}
+                  width={barWidth}
+                  height={Math.max(2, salienceHeight)}
+                  rx="3"
+                  fill="url(#sv-salience)"
+                />
+                <rect
+                  x={centre + 2}
+                  y={base - salienceHeight}
+                  width={barWidth}
+                  height="2"
+                  rx="1"
+                  fill="#A5F3FC"
+                  opacity="0.85"
+                />
+                <text
+                  x={centre - barWidth / 2 - 2}
+                  y={base - volumeHeight - 5}
+                  textAnchor="middle"
+                  fontSize="8.5"
+                  fill={isActive ? '#D1FAE5' : '#7F9A90'}
+                >
+                  {Math.round(volume)}%
+                </text>
+                <text
+                  x={centre + barWidth / 2 + 2}
+                  y={base - salienceHeight - 5}
+                  textAnchor="middle"
+                  fontSize="8.5"
+                  fill={isActive ? '#CFFAFE' : '#6F8E96'}
+                >
+                  {fmtNumber(salienceOf(section))}
+                </text>
+                {labelLines[index].map((line, lineIndex) => (
+                  <text
+                    key={`${index}-label-${lineIndex}`}
+                    x={centre}
+                    y={base + 16 + lineIndex * 10.5}
+                    textAnchor="middle"
+                    fontSize="8.6"
+                    fill={isActive ? '#ECECEC' : '#8A8A8A'}
+                  >
+                    {line}
+                  </text>
+                ))}
+              </g>
+            )
+          })}
+          <polyline
+            points={ordered
+              .map((section, index) => {
+                const centre = pad.left + index * groupWidth + groupWidth / 2
+                const y = base - ((saliencePct(section) / ceiling) * plotHeight)
+                return `${centre},${y}`
+              })
+              .join(' ')}
+            fill="none"
+            stroke="#22D3EE"
+            strokeWidth="1.4"
+            strokeOpacity="0.55"
+            strokeLinejoin="round"
+          />
+          {ordered.map((section, index) => {
+            const centre = pad.left + index * groupWidth + groupWidth / 2
+            const y = base - ((saliencePct(section) / ceiling) * plotHeight)
+            return <circle key={`dot-${index}`} cx={centre} cy={y} r="3" fill="#0D0D0D" stroke="#22D3EE" strokeWidth="1.4" />
+          })}
         </svg>
       </div>
-      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1.5 text-[10.5px] text-[#8A8A8A]">
-        <span className="inline-flex items-center gap-1.5">
-          <span className="h-2 w-2 rounded-full bg-[#34D399]" /> raw word share
-        </span>
-        <span className="inline-flex items-center gap-1.5">
-          <span className="h-2 w-2 rounded-full bg-[#22D3EE]" /> avg salience (×10)
-        </span>
-      </div>
+      {legend}
+      {tooltip}
     </div>
+  )
+}
+
+/** Small SVG rating chip for the ranked layout (HTML pills cannot sit in SVG). */
+function SignalRatingPillProxy({ x, y, rating }) {
+  const fill =
+    rating === 'High Signal' ? '#34D399' : rating === 'Balanced' ? '#22D3EE' : '#FBBF24'
+  return (
+    <g>
+      <circle cx={x} cy={y} r="3" fill={fill} />
+      <text x={x + 8} y={y + 3} fontSize="9" fill="#9B9B9B">
+        {rating}
+      </text>
+    </g>
   )
 }
 
@@ -474,10 +948,27 @@ const ANALYTICS_VIEWS = [
   { id: 'table', label: 'Structured Data Table' },
 ]
 
-function AnalyticsSuite({ payload }) {
+function AnalyticsSuite({ payload, textMetrics }) {
   const [view, setView] = useState('metrics')
   const sections = payload?.sections ?? []
   const numeric = payload?.numericSeries ?? []
+
+  // Three tiers keep Metric Comparison populated: numbers scanned from the
+  // whole essay, then numbers the spider foraged, then derived section KPIs.
+  const metricData = useMemo(() => {
+    if (textMetrics?.hasNumbers) return textMetrics
+    const legacy = rowsFromNumericPoints(numeric)
+    if (legacy.length) {
+      return {
+        rows: legacy,
+        total: legacy.length,
+        sections: new Set(legacy.map((row) => row.sectionHeading)).size,
+        hasNumbers: true,
+        fallback: false,
+      }
+    }
+    return buildFallbackMetrics(sections)
+  }, [textMetrics, numeric, sections])
 
   return (
     <section className="min-w-0 rounded-2xl border border-[#2F2F2F] bg-[#1E1E1E] p-5">
@@ -485,7 +976,7 @@ function AnalyticsSuite({ payload }) {
         <div className="min-w-0">
           <h2 className="text-[13px] font-medium text-[#ECECEC]">Julius Analytics</h2>
           <p className="mt-0.5 text-[11.5px] text-[#8A8A8A]">
-            {numeric.length} structured numeric points · {sections.length} section scores
+            {metricData.total} quantitative values · {sections.length} section scores
           </p>
         </div>
         <div
@@ -512,7 +1003,7 @@ function AnalyticsSuite({ payload }) {
         </div>
       </div>
       <div className="mt-4">
-        {view === 'metrics' ? <MetricComparisonChart points={numeric} /> : null}
+        {view === 'metrics' ? <MetricComparisonChart data={metricData} /> : null}
         {view === 'salience' ? <SalienceVolumeChart sections={sections} /> : null}
         {view === 'table' ? <StructuredTable sections={sections} query={payload?.query ?? ''} /> : null}
       </div>
@@ -1086,6 +1577,9 @@ function Skeleton() {
 }
 
 export default function JuliusNapkin({ visuals, busy, error, research, spiderMemory, scope = 'spider', onRegenerate }) {
+  // Full-text scan runs as soon as the essay exists, so the metric chart is
+  // populated without waiting for the spider to grip each number.
+  const textMetrics = useMemo(() => extractTextMetrics(research?.markdown ?? ''), [research?.markdown])
   const payloadBar = (
     <PayloadBar payload={spiderMemory} scope={scope} busy={busy} research={research} onRegenerate={onRegenerate} />
   )
@@ -1134,9 +1628,9 @@ export default function JuliusNapkin({ visuals, busy, error, research, spiderMem
         </p>
       </div>
 
-      <KpiStrip payload={spiderMemory} />
+      <KpiStrip payload={spiderMemory} fullTextCount={textMetrics.total} />
       <Takeaways payload={spiderMemory} />
-      <AnalyticsSuite payload={spiderMemory} />
+      <AnalyticsSuite payload={spiderMemory} textMetrics={textMetrics} />
       <ConceptGraphPanel payload={spiderMemory} diagram={visuals.diagram} />
 
       <p className="px-1 text-[11.5px] leading-5 text-[#9B9B9B]">

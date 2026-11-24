@@ -271,6 +271,12 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
     headings: new Map(),
     gripLog: [],
     topConcepts: [],
+    // Predator foraging memory: the lane it has just harvested, which lane it
+    // is currently sweeping, and when it last paused to orient. Mutated in
+    // place, never rendered, so the movement loop never restarts.
+    recentX: [],
+    sweep: { lane: 'center', until: 0 },
+    lastScanAt: -99,
   })
 
   // Audio lives entirely in refs. Nothing here is read or written by the
@@ -705,6 +711,8 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       })
     }
     const LEG_MAX = Math.max(...legs.map((leg) => leg.L1 + leg.L2))
+    // Palps and front legs, cached once: these twitch during an orienting scan.
+    const twitchLegs = legs.filter((leg) => leg.palp || leg.idx === 0)
 
     const S = {
       p: V(0, 0),
@@ -715,6 +723,10 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       target: V(),
       tUntil: 0,
       phase: R() * 10,
+      wander: R() * 10,
+      scanUntil: 0,
+      scanTwitchAt: 0,
+      scanLook: V(),
       spine: Array.from({ length: BODY_SEGMENTS }, () => V()),
       abd: V(),
       spin: V(),
@@ -1170,6 +1182,21 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
     const TRAVEL_DECAY = 0.012
     const HIGH_VALUE = 3.5
     const KEYWORD_MIN = 4
+    // Foraging shape: stay out of one vertical lane, sweep the full text
+    // width, wobble while travelling, and pause to orient on notable targets.
+    const TUNNEL_RADIUS = 130
+    const TUNNEL_PENALTY = 3.2
+    const TUNNEL_MEMORY = 4
+    const SWEEP_MIN = 2.4
+    const SWEEP_MAX = 3.6
+    const SWEEP_BONUS = 2.8
+    const SWEEP_HUNT_BONUS = 5
+    const WANDER_DEADZONE = 35
+    const WANDER_FALLOFF = 90
+    const WANDER_STRENGTH = 0.42
+    const SCAN_MIN = 0.2
+    const SCAN_MAX = 0.35
+    const SCAN_COOLDOWN = 1.6
 
     function queryKeywords() {
       const raw = `${metaRef.current.query || ''}`.toLowerCase()
@@ -1233,19 +1260,87 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       return Math.min(8, value)
     }
 
-    /** Value + cluster cohesion - travel cost. Position is never drawn. */
-    function scoreWordCandidate(candidate, highValue) {
+    /** Mean X of the last few harvested words: the lane the predator favours. */
+    function recentLaneX() {
+      const recent = navBrainRef.current.recentX
+      if (!recent.length) return null
+      let sum = 0
+      for (const x of recent) sum += x
+      return sum / recent.length
+    }
+
+    function rememberVisitedX(word) {
+      const box = cache.boxes.get(word.id)
+      if (!box) return
+      const recent = navBrainRef.current.recentX
+      recent.push(box.x + box.w / 2)
+      if (recent.length > TUNNEL_MEMORY) recent.splice(0, recent.length - TUNNEL_MEMORY)
+    }
+
+    /**
+     * Periodic horizontal sweep. A lane preference is re-rolled every few
+     * seconds so the hunt alternates across right, centre and the occasional
+     * left pass instead of settling into one column.
+     */
+    function sweepBias(candidate, box) {
+      const sweep = navBrainRef.current.sweep
+      const span = Math.max(1, box.r - box.l)
+      const u = clamp((candidate.centre.x - box.l) / span, 0, 1)
+      if (now >= sweep.until) {
+        const roll = R()
+        sweep.lane = roll < 0.48 ? 'right' : roll < 0.86 ? 'center' : 'left'
+        sweep.until = now + range([SWEEP_MIN, SWEEP_MAX])
+      }
+      // A notable word inside the swept lane is worth travelling for: the
+      // bonus is large enough to beat a few hundred px of travel decay, so a
+      // right-side heading actually pulls the predator across the paragraph.
+      const hunt = candidate.base >= HIGH_VALUE ? SWEEP_HUNT_BONUS : 0
+      if (sweep.lane === 'right') {
+        const lane = u > 0.6 ? SWEEP_BONUS : u > 0.42 ? SWEEP_BONUS * 0.4 : -SWEEP_BONUS * 0.25
+        return lane + (u > 0.55 ? hunt : 0)
+      }
+      if (sweep.lane === 'left') {
+        const lane = u < 0.38 ? SWEEP_BONUS : u < 0.55 ? SWEEP_BONUS * 0.4 : -SWEEP_BONUS * 0.25
+        return lane + (u < 0.45 ? hunt : 0)
+      }
+      const lane = u > 0.32 && u < 0.68 ? SWEEP_BONUS * 0.85 : 0
+      return lane + (u > 0.28 && u < 0.72 ? hunt : 0)
+    }
+
+    /** Strong, value-dense words (headings, figures, names, query terms). */
+    function isNotable(word) {
+      if (!word) return false
+      if (word.strong || /\d/.test(word.text)) return true
+      const token = word.text.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '')
+      if (/^[A-Z][A-Za-z0-9-]{2,}$/.test(token)) return true
+      return matchesKeywords(word)
+    }
+
+    /** Value + cohesion - travel cost - tunnelling, plus the sweep pull. */
+    function scoreWordCandidate(candidate, highValue, box) {
       let cohesion = 0
       for (const other of highValue) {
         if (other.id === candidate.id) continue
         if (distance(candidate.centre, other.centre) <= CLUSTER_RADIUS) cohesion += 1.5
       }
       const travel = distance(candidate.centre, S.p)
-      return { score: candidate.base + cohesion - travel * TRAVEL_DECAY }
+      let tunnel = 0
+      const laneX = recentLaneX()
+      if (laneX != null && navBrainRef.current.recentX.length >= 2) {
+        const drift = Math.abs(candidate.centre.x - laneX)
+        if (drift < TUNNEL_RADIUS) tunnel = -TUNNEL_PENALTY * (1 - drift / TUNNEL_RADIUS)
+      }
+      // A light downward pull keeps wide sweeps from stalling reading order,
+      // without discouraging side-to-side hunting on the current row.
+      const forward = candidate.centre.y > S.p.y + 20 ? 0.8 : 0
+      return {
+        score: candidate.base + cohesion - travel * TRAVEL_DECAY + tunnel + sweepBias(candidate, box) + forward,
+      }
     }
 
     function evaluateBrain() {
       const brain = navBrainRef.current
+      const previousTargetId = brain.targetId
       brain.evaluatedAt = now
       brain.keywords = queryKeywords()
       brain.headings.clear()
@@ -1276,10 +1371,11 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         return
       }
 
+      const clampBox = safeBox()
       const highValue = candidates.filter((candidate) => candidate.base >= HIGH_VALUE)
       let best = null
       for (const candidate of candidates) {
-        const result = scoreWordCandidate(candidate, highValue)
+        const result = scoreWordCandidate(candidate, highValue, clampBox)
         brain.scores.set(candidate.id, result.score)
         if (!best || result.score > best.score) best = { ...candidate, score: result.score }
       }
@@ -1304,12 +1400,28 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
         clusterWordIds.push(best.id)
       }
 
-      const box = safeBox()
-      brain.target = V(clamp(sumX / count, box.l, box.r), clamp(sumY / count, box.t, box.b))
+      brain.target = V(
+        clamp(sumX / count, clampBox.l, clampBox.r),
+        clamp(sumY / count, clampBox.t, clampBox.b),
+      )
       brain.targetId = best.id
       brain.clusterId = `cluster:${best.id}`
       brain.clusterWordIds = clusterWordIds
       brain.evaluatedAt = now
+
+      // Acquiring a notable target (heading, figure, name, query term) pauses
+      // the hunt for a beat: the head turns and the palps test the air before
+      // the lunge. Rate-limited so dense prose cannot freeze the crawl.
+      if (
+        best.id !== previousTargetId &&
+        (best.base >= HIGH_VALUE || isNotable(best.word)) &&
+        now - brain.lastScanAt > SCAN_COOLDOWN
+      ) {
+        brain.lastScanAt = now
+        S.scanUntil = now + SCAN_MIN + R() * (SCAN_MAX - SCAN_MIN)
+        S.scanLook = V(brain.target.x, brain.target.y)
+        S.scanTwitchAt = now
+      }
     }
 
     function gripClusterId(wordId) {
@@ -1342,6 +1454,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       const box = cache.boxes.get(word.id)
       const centre = box ? V(box.x + box.w / 2, box.y + box.h / 2) : S.p
       const score = evaluated ?? semanticValue(word, word.id) - distance(centre, S.p) * TRAVEL_DECAY
+      rememberVisitedX(word)
       brain.gripLog.push({
         word: word.text,
         score: Math.round(score * 100) / 100,
@@ -1604,7 +1717,8 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
       const burst = auto ? T.burstFloor + (1 - T.burstFloor) * Math.min(1, pulse) : 1
       const to = sub(S.target, S.p)
       const d = length(to)
-      const maxSpeed = auto ? T.cruise * burst : T.cursor
+      const scanning = auto && now < S.scanUntil
+      const maxSpeed = auto ? T.cruise * burst * (scanning ? 0.22 : 1) : T.cursor
       const brake = !auto || S.brake
       let want = V()
       if (d > 2) {
@@ -1619,12 +1733,45 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
           want = mul(to, mix(arriveSpeed, maxSpeed, seekWeight) / d)
         }
       }
+      if (auto && !brake && d > WANDER_DEADZONE && !scanning) {
+        // Organic S-curve locomotion: a smooth, time-varying perpendicular
+        // force (incommensurate sines, never per-frame noise) bends the path.
+        // It fades to exactly zero inside the landing radius, so the lunge
+        // still converges on the word.
+        S.wander += dt * (1.05 + pulse * 0.55)
+        const wobble =
+          Math.sin(S.wander * 2.05) * 0.62 +
+          Math.sin(S.wander * 0.81 + 1.3) * 0.28 +
+          Math.sin(S.wander * 4.3 + 0.6) * 0.1
+        const falloff = clamp((d - WANDER_DEADZONE) / WANDER_FALLOFF, 0, 1)
+        const eased = falloff * falloff * (3 - 2 * falloff)
+        const push = wobble * eased * WANDER_STRENGTH * maxSpeed
+        want = add(want, V((-to.y / d) * push, (to.x / d) * push))
+        want = capLength(want, maxSpeed * 1.25)
+      }
       S.v = lerp(S.v, want, damp(auto ? 6.5 : 10, dt))
       S.p = add(S.p, mul(S.v, dt))
 
       const speed = length(S.v)
-      if (speed > 3) S.heading = angleLerp(S.heading, Math.atan2(S.v.y, S.v.x), damp(4 + speed * 0.02, dt))
-      S.heading += (R() - 0.5) * 0.02
+      if (scanning) {
+        // Square up on the target while the body creeps forward.
+        const aim = S.scanLook.x || S.scanLook.y ? S.scanLook : S.target
+        S.heading = angleLerp(S.heading, Math.atan2(aim.y - S.p.y, aim.x - S.p.x), damp(14, dt))
+      } else if (speed > 3) {
+        S.heading = angleLerp(S.heading, Math.atan2(S.v.y, S.v.x), damp(4 + speed * 0.02, dt))
+      }
+      S.heading += (R() - 0.5) * (scanning ? 0.01 : 0.02)
+
+      // Orienting twitch: palps and front legs tap at the air while the head
+      // turns, then the crawl surges forward as the scan window closes.
+      if (scanning && now > S.scanTwitchAt) {
+        S.scanTwitchAt = now + 0.05 + R() * 0.05
+        const leg = twitchLegs[Math.floor(R() * twitchLegs.length)]
+        if (leg && !leg.stepping) {
+          startStep(leg, true)
+          leg.dur = 0.05 + R() * 0.03
+        }
+      }
 
       gripActive = auto || (mouse.has && speed > 4)
       if (bodyReady && gripActive) {

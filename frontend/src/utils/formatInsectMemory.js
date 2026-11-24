@@ -133,6 +133,9 @@ function sectionFrom(source) {
     dwellMs: source.dwellMs,
     words: source.words,
     wordShare: source.wordShare ?? 0,
+    // Share of this section's grips that cleared the signal threshold; used by
+    // the analytics fallback when the essay itself contains no numbers.
+    signalShare: source.signalShare ?? 0,
     numericSeries: source.numericSeries ?? [],
     summarySnippet: source.summarySnippet,
   }
@@ -206,6 +209,9 @@ function buildSection(heading, entries, fallbackEntities, extra = {}) {
   const avgScore = scores.length
     ? Math.round((scores.reduce((sum, score) => sum + score, 0) / scores.length) * 10) / 10
     : 0
+  const signalShare = scores.length
+    ? Math.round((scores.filter((score) => score >= MIN_CONCEPT_SCORE).length / scores.length) * 100)
+    : 0
   const topScore = scores.length ? Math.round(Math.max(...scores) * 10) / 10 : 0
 
   const summaryParts = []
@@ -218,6 +224,7 @@ function buildSection(heading, entries, fallbackEntities, extra = {}) {
     metrics,
     avgScore,
     topScore,
+    signalShare,
     gripCount: entries.length,
     dwellMs: Math.max(0, Math.round(numberish(extra.dwellMs))),
     words: Math.max(0, Math.round(numberish(extra.words))),
