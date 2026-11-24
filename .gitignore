@@ -12,3 +12,7 @@ backend/audio_cache/
 *.bin
 *.safetensors
 .DS_Store
+
+backend/models/*.onnx
+backend/models/*.bin
+backend/audio_cache/

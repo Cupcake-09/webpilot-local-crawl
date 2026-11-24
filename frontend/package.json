@@ -1,9 +1,9 @@
 {
-  "name": "webpilot-local-frontend",
+  "name": "rivet-local-frontend",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "WebPilot Local — ChatGPT-inspired research workspace for the FastAPI research engine",
+  "description": "Rivet Local — ChatGPT-inspired research workspace for the FastAPI research engine",
   "scripts": {
     "dev": "vite --port 3000 --strictPort",
     "build": "vite build",

@@ -1,21 +1,18 @@
-"""Streaming research, SVG chart data and podcast endpoints for WebPilot Local."""
+"""Streaming research, SVG chart data and podcast endpoints for Rivet Local."""
 
 import asyncio
-import hashlib
 import json
 import os
 import re
-from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-router = APIRouter()
+import tts_service
 
-CACHE_DIR = Path("audio_cache")
-CACHE_DIR.mkdir(exist_ok=True)
+router = APIRouter()
 
 STOPWORDS = {
     "the", "and", "for", "with", "from", "that", "this", "what", "which", "into", "about", "your",
@@ -53,8 +50,22 @@ class PodcastLine(BaseModel):
     text: str
 
 
+class PodcastPreviewRequest(BaseModel):
+    voice_id: str
+    text: str = ""
+
+
+class PodcastTurnRequest(BaseModel):
+    text: str
+    voice_id: str = ""
+    rate: float = 1.0
+
+
 class PodcastAudioRequest(BaseModel):
     lines: list[PodcastLine] = []
+    host_a_voice: str | None = None
+    host_b_voice: str | None = None
+    speed: float = 1.0
 
 
 def _resolve_llm(request: Request):
@@ -593,36 +604,77 @@ async def generate_podcast(req: PodcastRequest, request: Request):
     }
 
 
+def _audio_file(path):
+    """Clips are content addressed, so the browser may cache them forever."""
+    return FileResponse(
+        path,
+        media_type=tts_service.media_type_for(path),
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@router.get("/api/podcast/voices")
+async def podcast_voices():
+    """Voice catalog, filtered to the engines that work on this machine."""
+    return {
+        "status": "success",
+        "voices": tts_service.list_voices(),
+        "defaults": tts_service.default_voices(),
+        "engines": {"kokoro": tts_service.kokoro_available(), "edge": tts_service.edge_available()},
+    }
+
+
+@router.post("/api/podcast/preview")
+async def podcast_preview(req: PodcastPreviewRequest):
+    """One-sentence sample so a host voice can be auditioned before a full episode."""
+    try:
+        audio_path = await tts_service.synthesize_preview(req.voice_id, req.text)
+    except tts_service.UnknownVoice as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except tts_service.VoiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except tts_service.TTSError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _audio_file(audio_path)
+
+
+@router.post("/api/podcast/turn")
+async def podcast_turn(req: PodcastTurnRequest):
+    """Voice a single dialogue turn - the unit of the studio's streaming queue."""
+    text = " ".join((req.text or "").split())
+    if not text:
+        raise HTTPException(status_code=400, detail="Cannot synthesize an empty turn.")
+    voice_id = (req.voice_id or "").strip() or tts_service.default_voices()["host_a"]
+    try:
+        audio_path = await tts_service.synthesize(text[:1200], voice_id, req.rate)
+    except tts_service.UnknownVoice as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except tts_service.VoiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except tts_service.TTSError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _audio_file(audio_path)
+
+
 @router.post("/api/podcast-audio")
 async def podcast_audio(req: PodcastAudioRequest):
-    api_key = os.getenv("ELEVENLABS_API_KEY")
-    if not api_key:
-        return {"fallback": True, "script": "\n\n".join(f"{line.speaker}: {line.text}" for line in req.lines)}
+    lines = [
+        {"speaker": line.speaker, "text": line.text}
+        for line in req.lines
+        if (line.text or "").strip()
+    ]
+    if not lines:
+        return {"fallback": True, "script": ""}
 
-    voices = {
-        "Host A": os.getenv("ELEVENLABS_VOICE_A", "21m00Tcm4TlvDq8ikWAM"),
-        "Host B": os.getenv("ELEVENLABS_VOICE_B", "pNInz6obpgDQGcFmaJgB"),
-    }
-    signature = b"".join(line.text.encode() + line.speaker.encode() for line in req.lines)
-    audio_path = CACHE_DIR / f"podcast-{hashlib.md5(signature).hexdigest()}.mp3"
-    if not audio_path.exists():
-        chunks = []
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            for line in req.lines:
-                text = (line.text or "").strip()
-                if not text:
-                    continue
-                voice = voices.get(line.speaker, voices["Host A"])
-                response = await client.post(
-                    f"https://api.elevenlabs.io/v1/text-to-speech/{voice}",
-                    headers={"xi-api-key": api_key, "Content-Type": "application/json"},
-                    json={"text": text[:2500], "model_id": "eleven_flash_v2_5"},
-                )
-                if response.status_code != 200:
-                    raise HTTPException(status_code=response.status_code, detail=response.text)
-                chunks.append(response.content)
-        if not chunks:
-            return {"fallback": True, "script": ""}
-        audio_path.write_bytes(b"".join(chunks))
+    try:
+        audio_path = await tts_service.render_dialogue(lines, req.host_a_voice, req.host_b_voice, req.speed)
+    except tts_service.VoiceUnavailable:
+        # No local engine: browser speech synthesis keeps the studio usable.
+        return {
+            "fallback": True,
+            "script": "\n\n".join(f"{line['speaker']}: {line['text']}" for line in lines),
+        }
+    except tts_service.TTSError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    return FileResponse(audio_path, media_type="audio/mpeg")
+    return _audio_file(audio_path)

@@ -1,5 +1,5 @@
 /**
- * Thin client for the WebPilot Local FastAPI engine.
+ * Thin client for the Rivet Local FastAPI engine.
  * Override the base URL with VITE_API_BASE if the backend lives elsewhere.
  */
 import { llmHeaders } from './llm.js'
@@ -139,12 +139,77 @@ export async function generatePodcast({ query, markdown, rows = [], memory = nul
   return res.json()
 }
 
-/** POST /api/podcast-audio → mp3 blob when ElevenLabs is configured, else JSON fallback. */
-export async function requestPodcastAudio(lines) {
+/** GET /api/podcast/voices → voice catalog grouped by engine, plus a default host pair. */
+export async function fetchPodcastVoices() {
+  const res = await fetch(`${API_BASE}/api/podcast/voices`)
+
+  if (!res.ok) throw new Error(await readError(res))
+
+  const data = await res.json()
+  return {
+    voices: Array.isArray(data.voices)
+      ? data.voices.map((voice) => ({
+          voiceId: voice.voice_id ?? '',
+          label: voice.label ?? voice.voice_id ?? '',
+          engine: voice.engine ?? '',
+          group: voice.group ?? 'Voices',
+          language: voice.language ?? '',
+          gender: voice.gender ?? '',
+        }))
+      : [],
+    defaults: {
+      hostA: data.defaults?.host_a ?? '',
+      hostB: data.defaults?.host_b ?? '',
+    },
+    engines: {
+      kokoro: Boolean(data.engines?.kokoro),
+      edge: Boolean(data.engines?.edge),
+    },
+  }
+}
+
+/** POST /api/podcast/preview → short audio blob for one voice. */
+export async function requestVoicePreview(voiceId) {
+  const res = await fetch(`${API_BASE}/api/podcast/preview`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ voice_id: voiceId }),
+  })
+
+  if (!res.ok) throw new Error(await readError(res))
+
+  const blob = await res.blob()
+  if (!blob.size) throw new Error('The preview returned no audio')
+  return { url: URL.createObjectURL(blob) }
+}
+
+/** POST /api/podcast/turn → one voiced turn, streamed into the studio's playback queue. */
+export async function requestPodcastTurn({ text, voiceId, rate = 1.0, signal } = {}) {
+  const res = await fetch(`${API_BASE}/api/podcast/turn`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, voice_id: voiceId || undefined, rate }),
+    signal,
+  })
+
+  if (!res.ok) throw new Error(await readError(res))
+
+  const blob = await res.blob()
+  if (!blob.size) throw new Error('The voice engine returned an empty audio stream')
+  return { url: URL.createObjectURL(blob) }
+}
+
+/** POST /api/podcast-audio → voice-clip file, or a JSON fallback when no engine is installed. */
+export async function requestPodcastAudio(lines, { hostAVoice, hostBVoice, speed } = {}) {
   const res = await fetch(`${API_BASE}/api/podcast-audio`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ lines }),
+    body: JSON.stringify({
+      lines,
+      host_a_voice: hostAVoice || undefined,
+      host_b_voice: hostBVoice || undefined,
+      speed,
+    }),
   })
 
   if (!res.ok) throw new Error(await readError(res))
@@ -156,7 +221,7 @@ export async function requestPodcastAudio(lines) {
   }
 
   const blob = await res.blob()
-  if (!blob.size) throw new Error('ElevenLabs returned an empty audio stream')
+  if (!blob.size) throw new Error('The voice engine returned an empty audio stream')
   return { fallback: false, url: URL.createObjectURL(blob) }
 }
 
@@ -171,7 +236,7 @@ export function buildCSV(rows) {
   ].join('\r\n')
 }
 
-export function downloadCSV(rows, filename = 'webpilot-export.csv') {
+export function downloadCSV(rows, filename = 'rivet-export.csv') {
   const csv = buildCSV(rows)
   if (!csv) return false
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })

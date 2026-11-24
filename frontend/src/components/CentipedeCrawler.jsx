@@ -24,9 +24,9 @@ import {
  *    1.5s intervals and on completion.
  */
 
-const STARTER = `# WebPilot research
+const STARTER = `# Rivet research
 
-Ask a question and this page becomes a streaming research essay. Paste a URL and WebPilot reads that page instead. The spider above is the original open-source DOM crawler, walking real words as they arrive.
+Ask a question and this page becomes a streaming research essay. Paste a URL and Rivet reads that page instead. The spider above is the original open-source DOM crawler, walking real words as they arrive.
 
 Auto-iterate keeps the spider moving through the incoming text, marking key phrases in slate blue and filing entities into the notes drawer. Follow cursor parks the autonomous reader and lets the same legs walk toward your pointer at a relaxed pace, stepping from word to word as it goes.
 
@@ -2152,7 +2152,7 @@ export default function CentipedeCrawler({ markdown, streaming, mode, query, sou
           <div className="flex shrink-0 items-center gap-1">
             <button
               type="button"
-              onClick={() => downloadCSV(csvRows, 'webpilot-notes.csv')}
+              onClick={() => downloadCSV(csvRows, 'rivet-notes.csv')}
               disabled={!rows.length}
               className="rounded-full px-2.5 py-1.5 text-[11.5px] text-[#9B9B9B] transition hover:bg-[#2A2A2A] hover:text-[#ECECEC] disabled:opacity-40"
             >

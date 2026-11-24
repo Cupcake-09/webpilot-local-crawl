@@ -1,4 +1,5 @@
 ﻿import os, sys, asyncio, hashlib, json, re
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,6 +7,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import httpx
+
+import tts_service
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -16,7 +19,18 @@ from langchain_openai import ChatOpenAI
 
 load_dotenv()
 
-app = FastAPI(title="WebPilot Local Engine")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Warm Kokoro once at startup so the first Play click has no cold start."""
+    warmup = asyncio.create_task(tts_service.warmup())
+    _app.state.tts_warmup = warmup
+    try:
+        yield
+    finally:
+        warmup.cancel()
+
+
+app = FastAPI(title="Rivet Local Engine", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

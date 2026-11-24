@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
-import { requestPodcastAudio } from '../lib/api.js'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { fetchPodcastVoices, requestPodcastTurn, requestVoicePreview } from '../lib/api.js'
 
 function tokens(text) {
   return [...String(text).matchAll(/\S+/g)].map((match) => ({ text: match[0], start: match.index, end: match.index + match[0].length }))
@@ -23,31 +23,91 @@ export default function PodcastStudio({ podcast, busy, error, research, spiderMe
 
   const [playing, setPlaying] = useState(false)
   const [preparing, setPreparing] = useState(false)
-  const [audioUrl, setAudioUrl] = useState(null)
   const [source, setSource] = useState('')
   const [activeLine, setActiveLine] = useState(-1)
   const [activeWord, setActiveWord] = useState(null)
   const [playerError, setPlayerError] = useState('')
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
+  const [turnIndex, setTurnIndex] = useState(-1)
+  const [elapsed, setElapsed] = useState(0)
+  const [queueNote, setQueueNote] = useState('')
+
+  const [voices, setVoices] = useState([])
+  const [voicesLoading, setVoicesLoading] = useState(true)
+  const [voiceError, setVoiceError] = useState('')
+  const [hostAVoice, setHostAVoice] = useState('')
+  const [hostBVoice, setHostBVoice] = useState('')
+  const [previewBusy, setPreviewBusy] = useState('')
 
   const audioRef = useRef(null)
+  const previewAudioRef = useRef(null)
+  const previewUrlRef = useRef(null)
   const voicesRef = useRef([])
   const speechRunRef = useRef({ cancelled: false })
+  const linesRef = useRef([])
+  const pairRef = useRef({ a: '', b: '' })
+  const startedRef = useRef(false)
+  const indexRef = useRef(-1)
+  const sessionRef = useRef({ cancelled: false, controllers: new Set(), urls: new Map(), pending: new Map() })
 
   useEffect(() => {
-    setPlaying(false)
-    setPreparing(false)
-    setActiveLine(-1)
-    setActiveWord(null)
-    setPlayerError('')
-    setCurrentTime(0)
-    setDuration(0)
-    setAudioUrl((previous) => {
-      if (previous) URL.revokeObjectURL(previous)
-      return null
-    })
-    if (typeof window !== 'undefined') window.speechSynthesis?.cancel()
+    let active = true
+    fetchPodcastVoices()
+      .then((data) => {
+        if (!active) return
+        const ids = data.voices.map((voice) => voice.voiceId)
+        setVoices(data.voices)
+        setHostAVoice(ids.includes(data.defaults.hostA) ? data.defaults.hostA : ids[0] || '')
+        setHostBVoice(ids.includes(data.defaults.hostB) ? data.defaults.hostB : ids[1] || ids[0] || '')
+      })
+      .catch((error) => {
+        if (active) setVoiceError(error?.message || 'Podcast voices could not be loaded.')
+      })
+      .finally(() => {
+        if (active) setVoicesLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  useEffect(
+    () => () => {
+      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current)
+      speechRunRef.current.cancelled = true
+      window.speechSynthesis?.cancel()
+      cancelSession()
+    },
+    [],
+  )
+
+  const voiceGroups = useMemo(() => {
+    const groups = []
+    for (const voice of voices) {
+      let group = groups.find((entry) => entry.label === voice.group)
+      if (!group) {
+        group = { label: voice.group, voices: [] }
+        groups.push(group)
+      }
+      group.voices.push(voice)
+    }
+    return groups
+  }, [voices])
+
+  const offlineCount = voices.filter((voice) => voice.engine === 'kokoro').length
+  const onlineCount = voices.filter((voice) => voice.engine === 'edge').length
+  const voiceSummary = voicesLoading
+    ? 'Loading voices…'
+    : [offlineCount ? `${offlineCount} offline` : '', onlineCount ? `${onlineCount} online` : '']
+        .filter(Boolean)
+        .join(' · ')
+  const voiceNote =
+    voiceError ||
+    (!voicesLoading && !voices.length ? 'No podcast voices are available on this machine.' : '')
+
+  useEffect(() => {
+    stopAll()
   }, [podcast])
 
   useEffect(() => {
@@ -63,20 +123,201 @@ export default function PodcastStudio({ podcast, busy, error, research, spiderMe
     }
   }, [])
 
+  const voiceLabel = (voiceId) =>
+    voices.find((voice) => voice.voiceId === voiceId)?.label || voiceId || 'the default voice'
+
+  // Keep the queue reading live state, so a voice switch applies to the next turn.
   useEffect(() => {
-    if (!audioUrl || !audioRef.current) return
-    audioRef.current.play().catch(() => {
+    pairRef.current = { a: hostAVoice, b: hostBVoice }
+  }, [hostAVoice, hostBVoice])
+
+  useEffect(() => {
+    linesRef.current = podcast?.dialogue || []
+  }, [podcast])
+
+  const revokeTurns = (session) => {
+    session.urls.forEach((url) => URL.revokeObjectURL(url))
+    session.urls.clear()
+    session.pending.clear()
+  }
+
+  const cancelSession = () => {
+    const previous = sessionRef.current
+    previous.cancelled = true
+    previous.controllers.forEach((controller) => controller.abort())
+    previous.controllers.clear()
+    revokeTurns(previous)
+    const next = { cancelled: false, controllers: new Set(), urls: new Map(), pending: new Map() }
+    sessionRef.current = next
+    return next
+  }
+
+  const fetchTurn = (index, session) => {
+    const cached = session.urls.get(index)
+    if (cached) return Promise.resolve(cached)
+    const pending = session.pending.get(index)
+    if (pending) return pending
+    const line = linesRef.current[index]
+    if (!line) return Promise.reject(new Error('That turn is no longer part of the script'))
+    const pair = pairRef.current
+    const voiceId = String(line.speaker || '').toLowerCase().endsWith('b') ? pair.b : pair.a
+    const controller = new AbortController()
+    session.controllers.add(controller)
+    const request = requestPodcastTurn({ text: line.text, voiceId, signal: controller.signal })
+      .then(({ url }) => {
+        if (session.cancelled || sessionRef.current !== session) {
+          URL.revokeObjectURL(url)
+          throw new DOMException('Turn cancelled', 'AbortError')
+        }
+        session.urls.set(index, url)
+        return url
+      })
+      .finally(() => {
+        session.controllers.delete(controller)
+        session.pending.delete(index)
+      })
+    session.pending.set(index, request)
+    return request
+  }
+
+  const finishQueue = (session) => {
+    if (session !== sessionRef.current) return
+    startedRef.current = false
+    indexRef.current = -1
+    revokeTurns(session)
+    setPlaying(false)
+    setPreparing(false)
+    setSource('')
+    setTurnIndex(-1)
+    setActiveLine(-1)
+    setActiveWord(null)
+    setCurrentTime(0)
+    setDuration(0)
+    setElapsed(0)
+    setQueueNote('')
+  }
+
+  const playIndex = async (index, session) => {
+    if (session.cancelled || sessionRef.current !== session) return
+    const total = linesRef.current.length
+    if (index >= total) {
+      finishQueue(session)
+      return
+    }
+    indexRef.current = index
+    startedRef.current = true
+    setSource('tts')
+    setTurnIndex(index)
+    setActiveLine(index)
+    setActiveWord(null)
+    setCurrentTime(0)
+    setDuration(0)
+    if (index === 0) {
+      setPreparing(true)
+      setElapsed(0)
+    }
+    let url
+    try {
+      url = await fetchTurn(index, session)
+    } catch (error) {
+      if (error?.name === 'AbortError' || session.cancelled || sessionRef.current !== session) return
+      const message = error?.message
+        ? `${error.message} Using browser voices instead.`
+        : 'The neural voices are unavailable, using browser voices.'
+      startSpeech(index)
+      setPlayerError(message)
+      return
+    }
+    if (session.cancelled || sessionRef.current !== session) return
+    const audio = audioRef.current
+    if (!audio) return
+    audio.src = url
+    audio.currentTime = 0
+    setPreparing(false)
+    try {
+      await audio.play()
+    } catch (error) {
+      if (error?.name === 'AbortError') return
       setPlaying(false)
       setPlayerError('The audio could not start. Press play again.')
-    })
-  }, [audioUrl])
+    }
+    // Prefetch the next turn with the live voice pair while this one plays.
+    if (index + 1 < total) fetchTurn(index + 1, session).catch(() => {})
+  }
 
-  useEffect(
-    () => () => {
-      if (audioUrl) URL.revokeObjectURL(audioUrl)
-    },
-    [audioUrl],
-  )
+  const handleTurnEnded = () => {
+    const finished = Number(audioRef.current?.duration)
+    if (Number.isFinite(finished) && finished > 0) setElapsed((previous) => previous + finished)
+    setActiveWord(null)
+    playIndex(indexRef.current + 1, sessionRef.current)
+  }
+
+  const stopAll = () => {
+    speechRunRef.current.cancelled = true
+    window.speechSynthesis?.cancel()
+    const audio = audioRef.current
+    if (audio) {
+      audio.pause()
+      audio.removeAttribute('src')
+      audio.load()
+    }
+    startedRef.current = false
+    indexRef.current = -1
+    cancelSession()
+    setPlaying(false)
+    setPreparing(false)
+    setSource('')
+    setTurnIndex(-1)
+    setActiveLine(-1)
+    setActiveWord(null)
+    setCurrentTime(0)
+    setDuration(0)
+    setElapsed(0)
+    setQueueNote('')
+  }
+
+  // A voice switch drops every queued or prefetched turn; the next turn is
+  // requested with the new pair, no script regeneration and no page reload.
+  useEffect(() => {
+    const session = sessionRef.current
+    const busy = startedRef.current || session.urls.size > 0 || session.controllers.size > 0
+    if (!busy) return
+    const keepIndex = playing ? indexRef.current : -1
+    session.controllers.forEach((controller) => controller.abort())
+    session.controllers.clear()
+    session.pending.clear()
+    for (const [index, url] of [...session.urls]) {
+      if (index === keepIndex) continue
+      URL.revokeObjectURL(url)
+      session.urls.delete(index)
+    }
+    if (keepIndex === -1) {
+      const audio = audioRef.current
+      if (audio) {
+        audio.pause()
+        audio.removeAttribute('src')
+        audio.load()
+      }
+      setPreparing(false)
+      setCurrentTime(0)
+      setDuration(0)
+    }
+    setPlayerError('')
+    setQueueNote(
+      `Voices switched - upcoming turns use ${voiceLabel(hostAVoice)} and ${voiceLabel(hostBVoice)}.`,
+    )
+  }, [hostAVoice, hostBVoice])
+
+  // Prime turn 0 while the studio is idle so the first Play click starts at once.
+  useEffect(() => {
+    if (!podcast || !hostAVoice || !linesRef.current.length) return undefined
+    const timer = setTimeout(() => {
+      if (startedRef.current) return
+      fetchTurn(0, sessionRef.current).catch(() => {})
+    }, 120)
+    return () => clearTimeout(timer)
+  }, [podcast, hostAVoice, hostBVoice])
+
 
   const pickVoices = () => {
     const english = voicesRef.current.filter((voice) => /^en/i.test(voice.lang))
@@ -96,8 +337,12 @@ export default function PodcastStudio({ podcast, busy, error, research, spiderMe
     synth.cancel()
     speechRunRef.current.cancelled = false
     const voices = pickVoices()
+    startedRef.current = false
+    indexRef.current = -1
+    cancelSession()
+    setTurnIndex(-1)
+    setQueueNote('')
     setSource('speech')
-    setAudioUrl(null)
     setPlaying(true)
     setPlayerError('')
     let index = startIndex
@@ -136,65 +381,89 @@ export default function PodcastStudio({ podcast, busy, error, research, spiderMe
     speakNext()
   }
 
-  const stopAll = () => {
-    speechRunRef.current.cancelled = true
-    window.speechSynthesis?.cancel()
-    if (audioRef.current) {
-      audioRef.current.pause()
-      audioRef.current.currentTime = 0
+  const handlePreview = async (voiceId) => {
+    if (!voiceId || previewBusy) return
+    previewAudioRef.current?.pause()
+    audioRef.current?.pause()
+    setPreviewBusy(voiceId)
+    setVoiceError('')
+    try {
+      const { url } = await requestVoicePreview(voiceId)
+      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current)
+      previewUrlRef.current = url
+      const player = previewAudioRef.current
+      if (!player) return
+      player.src = url
+      player.currentTime = 0
+      await player.play().catch(() => setVoiceError('The preview could not start. Press the speaker again.'))
+    } catch (requestError) {
+      setVoiceError(requestError?.message || 'Voice preview is unavailable.')
+    } finally {
+      setPreviewBusy('')
     }
-    setPlaying(false)
-    setActiveLine(-1)
-    setActiveWord(null)
-    setCurrentTime(0)
   }
 
+  const swapVoices = () => {
+    setHostAVoice(hostBVoice)
+    setHostBVoice(hostAVoice)
+  }
+
+  const previewButton = (voiceId, hostLabel) => (
+    <button
+      type="button"
+      onClick={() => handlePreview(voiceId)}
+      disabled={!voiceId || Boolean(previewBusy)}
+      title={`Preview ${hostLabel} voice`}
+      aria-label={`Preview ${hostLabel} voice`}
+      className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-[#2F2F2F] bg-[#0F0F0F] text-[#9B9B9B] transition hover:border-[#38BDF8]/50 hover:text-[#ECECEC] disabled:opacity-40"
+    >
+      {previewBusy === voiceId ? (
+        <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-[#ECECEC]/25 border-t-[#ECECEC]" />
+      ) : (
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.7"
+          strokeLinecap="round"
+          className="h-4 w-4"
+        >
+          <path d="M4 10v4h3l4 3.2V6.8L7 10H4Z" fill="currentColor" stroke="none" />
+          <path d="M15.5 9.6a3.6 3.6 0 0 1 0 4.8M17.9 7.2a6.8 6.8 0 0 1 0 9.6" />
+        </svg>
+      )}
+    </button>
+  )
+
   const handlePlay = async () => {
+    previewAudioRef.current?.pause()
     if (playing) {
-      stopAll()
+      audioRef.current?.pause()
+      setPlaying(false)
       return
     }
-    if (audioUrl) {
+    if (startedRef.current && indexRef.current >= 0 && audioRef.current?.src) {
       setPlayerError('')
-      audioRef.current?.play().catch(() => setPlayerError('The audio could not start.'))
+      try {
+        await audioRef.current.play()
+      } catch {
+        setPlayerError('The audio could not start.')
+      }
       return
     }
-    setPreparing(true)
     setPlayerError('')
-    try {
-      const result = await requestPodcastAudio(
-        lines.map((line) => ({ speaker: line.speaker, text: line.text })),
-      )
-      if (result.fallback) {
-        startSpeech(0)
-      } else {
-        setSource('eleven')
-        setAudioUrl(result.url)
-      }
-    } catch (requestError) {
-      setPlayerError(requestError?.message || 'ElevenLabs is unavailable, using browser voices.')
-      startSpeech(0)
-    } finally {
-      setPreparing(false)
-    }
+    setQueueNote('')
+    const start = startedRef.current && indexRef.current >= 0 ? indexRef.current : 0
+    const session = startedRef.current ? cancelSession() : sessionRef.current
+    if (start === 0) setElapsed(0)
+    playIndex(start, session)
   }
 
   const handleTimeUpdate = () => {
     const audio = audioRef.current
     if (!audio) return
     setCurrentTime(audio.currentTime)
-    const total = lines.reduce((sum, line) => sum + line.text.length, 0)
-    if (!total) return
-    const target = (audio.currentTime / Math.max(0.1, audio.duration || duration || 1)) * total
-    let running = 0
-    for (let index = 0; index < lines.length; index += 1) {
-      running += lines[index].text.length
-      if (target <= running) {
-        setActiveLine(index)
-        return
-      }
-    }
-    setActiveLine(lines.length - 1)
+    if (indexRef.current >= 0) setActiveLine(indexRef.current)
   }
 
   if (busy) {
@@ -222,16 +491,30 @@ export default function PodcastStudio({ podcast, busy, error, research, spiderMe
         <p className="mt-1.5 max-w-[540px] text-[12.5px] leading-6 text-[#9B9B9B]">
           {research
             ? 'Takeaways and the two-host dialogue are generated as soon as the current research finishes.'
-            : 'Finish a question or a URL read. WebPilot will pool the takeaways and produce a Host A / Host B audio overview automatically.'}
+            : 'Finish a question or a URL read. Rivet will pool the takeaways and produce a Host A / Host B audio overview automatically.'}
         </p>
       </div>
     )
   }
 
-  const progress = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0
+  const turnFraction = duration > 0 ? Math.min(1, currentTime / duration) : 0
+  const progress =
+    source === 'speech'
+      ? activeLine >= 0
+        ? ((activeLine + 1) / Math.max(1, lines.length)) * 100
+        : 0
+      : lines.length
+        ? ((Math.max(0, turnIndex) + turnFraction) / lines.length) * 100
+        : 0
+  const progressiveMeta =
+    source === 'speech'
+      ? `Line ${Math.max(0, activeLine + 1)} of ${lines.length}`
+      : turnIndex >= 0
+        ? `Turn ${turnIndex + 1} of ${lines.length}`
+        : `${lines.length} turns ready`
   const playerMeta =
-    source === 'eleven'
-      ? 'ElevenLabs voices'
+    source === 'tts'
+      ? 'Streaming neural voices'
       : source === 'speech'
         ? 'Dual-voice speech synthesis'
         : 'Two hosts · generated overview'
@@ -252,7 +535,74 @@ export default function PodcastStudio({ podcast, busy, error, research, spiderMe
           ) : null}
 
           <div className="mt-5 rounded-xl border border-[#2F2F2F] bg-[#171717] p-4">
+            <div className="flex items-baseline justify-between gap-3">
+              <p className="text-[12px] text-[#9B9B9B]">Host voices</p>
+              {voiceSummary ? <span className="truncate text-[11px] text-[#6E6E6E]">{voiceSummary}</span> : null}
+            </div>
+            <div className="mt-3 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-end gap-2">
+              <div className="min-w-0">
+                <p className="text-[11px] text-[#9B9B9B]">Host A</p>
+                <div className="mt-1 flex items-center gap-1.5">
+                  <select
+                    value={hostAVoice}
+                    onChange={(event) => setHostAVoice(event.target.value)}
+                    disabled={voicesLoading || !voices.length}
+                    aria-label="Host A voice"
+                    className="min-w-0 flex-1 rounded-lg border border-[#2F2F2F] bg-[#0F0F0F] px-2 py-1.5 text-[12px] text-[#ECECEC] outline-none focus:border-[#38BDF8]/60 disabled:opacity-50"
+                  >
+                    {voiceGroups.map((group) => (
+                      <optgroup key={group.label} label={group.label}>
+                        {group.voices.map((voice) => (
+                          <option key={voice.voiceId} value={voice.voiceId}>
+                            {voice.label} · {voice.language}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                  {previewButton(hostAVoice, 'Host A')}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={swapVoices}
+                disabled={!hostAVoice || !hostBVoice}
+                title="Swap voices"
+                aria-label="Swap voices"
+                className="mb-0.5 grid h-8 w-8 place-items-center rounded-lg border border-[#2F2F2F] bg-[#0F0F0F] text-[13px] text-[#9B9B9B] transition hover:border-[#38BDF8]/50 hover:text-[#ECECEC] disabled:opacity-40"
+              >
+                ⇄
+              </button>
+              <div className="min-w-0">
+                <p className="text-[11px] text-[#9B9B9B]">Host B</p>
+                <div className="mt-1 flex items-center gap-1.5">
+                  <select
+                    value={hostBVoice}
+                    onChange={(event) => setHostBVoice(event.target.value)}
+                    disabled={voicesLoading || !voices.length}
+                    aria-label="Host B voice"
+                    className="min-w-0 flex-1 rounded-lg border border-[#2F2F2F] bg-[#0F0F0F] px-2 py-1.5 text-[12px] text-[#ECECEC] outline-none focus:border-[#38BDF8]/60 disabled:opacity-50"
+                  >
+                    {voiceGroups.map((group) => (
+                      <optgroup key={group.label} label={group.label}>
+                        {group.voices.map((voice) => (
+                          <option key={voice.voiceId} value={voice.voiceId}>
+                            {voice.label} · {voice.language}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                  {previewButton(hostBVoice, 'Host B')}
+                </div>
+              </div>
+            </div>
+            {voiceNote ? <p className="mt-2 text-[11px] leading-5 text-[#ECECEC]">{voiceNote}</p> : null}
+          </div>
+
+          <div className="mt-4 rounded-xl border border-[#2F2F2F] bg-[#171717] p-4">
             <p className="text-[12.5px] text-[#9B9B9B]">{playerMeta}</p>
+            {queueNote ? <p className="mt-1 text-[11px] leading-5 text-[#38BDF8]">{queueNote}</p> : null}
             <div className="mt-3 flex items-center gap-3">
               <button
                 type="button"
@@ -278,31 +628,26 @@ export default function PodcastStudio({ podcast, busy, error, research, spiderMe
                 <div className="h-1.5 overflow-hidden rounded-full bg-[#2F2F2F]">
                   <div
                     className="h-full rounded-full bg-[#ECECEC] transition-[width] duration-200"
-                    style={{ width: `${source === 'speech' ? (activeLine >= 0 ? ((activeLine + 1) / Math.max(1, lines.length)) * 100 : 0) : progress}%` }}
+                    style={{ width: `${progress}%` }}
                   />
                 </div>
                 <div className="mt-1.5 flex justify-between text-[11px] text-[#9B9B9B]">
-                  <span>{source === 'speech' ? `Line ${Math.max(0, activeLine + 1)} of ${lines.length}` : formatTime(currentTime)}</span>
-                  <span>{source === 'speech' ? 'Browser voices' : formatTime(duration)}</span>
+                  <span>{progressiveMeta}</span>
+                  <span>{source === 'speech' ? 'Browser voices' : formatTime(elapsed + currentTime)}</span>
                 </div>
               </div>
             </div>
             {playerError ? <p className="mt-3 text-[11.5px] leading-5 text-[#ECECEC]">{playerError}</p> : null}
             <audio
               ref={audioRef}
-              src={audioUrl || undefined}
               onPlay={() => setPlaying(true)}
               onPause={() => setPlaying(false)}
-              onEnded={() => {
-                setPlaying(false)
-                setActiveLine(-1)
-                setCurrentTime(0)
-                if (audioRef.current) audioRef.current.currentTime = 0
-              }}
+              onEnded={handleTurnEnded}
               onTimeUpdate={handleTimeUpdate}
               onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
               className="hidden"
             />
+            <audio ref={previewAudioRef} className="hidden" />
           </div>
         </section>
 

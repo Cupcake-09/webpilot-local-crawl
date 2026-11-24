@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// WebPilot Local dashboard — fixed on http://localhost:3000
+// Rivet Local dashboard — fixed on http://localhost:3000
 export default defineConfig({
   plugins: [react()],
   server: {

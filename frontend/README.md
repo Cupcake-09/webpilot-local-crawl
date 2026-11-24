@@ -1,4 +1,4 @@
-# WebPilot Local — Frontend
+# Rivet Local — Frontend
 
 ChatGPT-style monochrome research workspace for the local FastAPI research engine.
 

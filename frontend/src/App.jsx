@@ -24,9 +24,9 @@ const VIEWS = [
   { id: 'podcast', label: 'NotebookLM & Podcast', description: 'Takeaways and audio overview', icon: 'headphones' },
 ]
 
-const STARTER = `# WebPilot research
+const STARTER = `# Rivet research
 
-Ask a question and this page becomes a streaming research essay. Paste a URL and WebPilot reads that page instead. The spider above is the original open-source DOM crawler, walking real words as they arrive.
+Ask a question and this page becomes a streaming research essay. Paste a URL and Rivet reads that page instead. The spider above is the original open-source DOM crawler, walking real words as they arrive.
 
 Auto-iterate keeps the spider moving through the incoming text, marking key phrases in slate blue and filing entities into the notes drawer. Follow cursor parks the autonomous reader and lets the same legs walk toward your pointer at a relaxed pace.`
 
@@ -372,10 +372,10 @@ export default function App() {
       >
         <div className="flex items-center gap-2.5 px-4 pb-2 pt-4">
           <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[#ECECEC] text-[13px] font-semibold text-[#0D0D0D]">
-            W
+            R
           </span>
           <div className="min-w-0">
-            <p className="truncate text-[15px] font-semibold leading-tight text-[#ECECEC]">WebPilot</p>
+            <p className="truncate text-[15px] font-semibold leading-tight text-[#ECECEC]">Rivet</p>
             <p className="truncate text-[11px] leading-tight text-[#9B9B9B]">Local research</p>
           </div>
           <button

@@ -1117,7 +1117,7 @@ export default function JuliusNapkin({ visuals, busy, error, research, spiderMem
           <p className="mt-1.5 max-w-[520px] text-[12.5px] leading-6 text-[#9B9B9B]">
             {research
               ? 'Charts are generated as soon as the current research finishes.'
-              : 'Start a question or paste a URL. When the research completes, WebPilot builds the charts and the concept map automatically.'}
+              : 'Start a question or paste a URL. When the research completes, Rivet builds the charts and the concept map automatically.'}
           </p>
         </div>
       </div>
